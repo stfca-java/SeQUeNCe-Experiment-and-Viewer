@@ -11,18 +11,15 @@ memory on the path Dijkstra picked.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import math
-from pathlib import Path
-import re
 import time
 import tkinter as tk
 from tkinter import font, ttk
 from typing import Any
 
-from env.draw_topo import build_graph
 from .appearance import DARK, LIGHT, Palette
-from .results import link_name, topology_links
+from .canvas import TopologyCanvas
+from .results import link_name
 
 EXPLAINER = ("Bell pairs are made link by link, then swaps join them into one end to end pair. "
              "No qubit travels the whole route.")
@@ -254,30 +251,17 @@ def build_steps(run: dict[str, Any], choice: int | None = None) -> list[Step]:
     return steps
 
 
-def graph_positions(topology) -> dict[str, tuple[float, float]]:
-    """Node positions from the same Graphviz layout the viewer draws."""
-    layout = json.loads(build_graph(topology).pipe(format="json"))
-    positions = {}
-    for item in layout.get("objects", []):
-        if "pos" in item:
-            x, y = item["pos"].split(",")[:2]
-            positions[item["name"]] = (float(x), -float(y))  # Graphviz puts y = 0 at the bottom.
-    return positions
-
-
 class PathReplay:
-    """A canvas that replaces the topology picture while a run is replayed."""
+    """Draw experiment events over the same canvas as the topology preview."""
 
-    def __init__(self, parent: tk.Widget, cover: tk.Widget, controls_parent: tk.Widget | None = None):
-        self.cover = cover
-        self.canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0, cursor="hand2")
-        self.controls = ttk.Frame(controls_parent or parent)
+    def __init__(self, canvas: TopologyCanvas, controls_parent: tk.Widget):
+        self.canvas = canvas
+        self.controls = ttk.Frame(controls_parent)
         self.colors: Palette = LIGHT
         self.marks = SERIES["light"]
         self.run: dict[str, Any] | None = None
         self.labels: list[str] = []
         self.steps: list[Step] = []
-        self.positions: dict[str, tuple[float, float]] = {}
         self.links: list[dict[str, Any]] = []
         self.index = 0
         self.elapsed = 0.0
@@ -286,9 +270,6 @@ class PathReplay:
         self._last = time.monotonic()
         self._timer = None
         self._dirty = True
-        self._screen: dict[str, tuple[float, float]] = {}
-        self._centre = (0.0, 0.0)
-        self._bounds = (0.0, 0.0, 100.0, 100.0)
         self._adjacent: set[str] = set()
 
         base = font.nametofont("TkDefaultFont").actual("family")
@@ -296,8 +277,7 @@ class PathReplay:
             "heading": font.Font(self.canvas, family=base, size=15, weight="bold"),
             "card": font.Font(self.canvas, family=base, size=18, weight="bold"),
             "caption": font.Font(self.canvas, family=base, size=13),
-            "node": font.Font(self.canvas, family=base, size=11, weight="bold"),
-            "small": font.Font(self.canvas, family=base, size=10),
+            "small": self.canvas.small_font,
         }
 
         self.play_button = ttk.Button(self.controls, text="Pause", width=7, command=self.toggle)
@@ -317,40 +297,46 @@ class PathReplay:
         self.controls.columnconfigure(6, weight=1)
         ttk.Button(self.controls, text="Close replay", command=self.close).grid(row=0, column=7, sticky="e")
 
-        self.canvas.bind("<Configure>", lambda event: self._mark_dirty())
-        self.canvas.bind("<Button-1>", lambda event: self.toggle())
+        self.canvas.bind("<<ReplayClick>>", lambda event: self.toggle())
         self.canvas.bind("<Destroy>", lambda event: self.destroy())
 
     # Public controls ----------------------------------------------------------------
 
     @property
     def active(self) -> bool:
-        return bool(self.canvas.grid_info())
+        return self.canvas.overlay is not None
 
     @property
     def waiting(self) -> bool:
         return self.waiting_since is not None
 
-    def show_waiting(self, topology, topology_path: Path) -> None:
-        """Draw the network while the simulation runs, before the replay is ready."""
-        with topology_path.open(encoding="utf-8-sig") as stream:
-            config = json.load(stream)
-        self._load_network(topology, topology_links(config))
+    def show_waiting(self) -> None:
+        """Draw the loaded network while waiting for simulation events."""
+        self.links = self.canvas.links
         self.run = None
         self.steps = []
+        self.playing = False
         self.waiting_since = time.monotonic()
         self._show()
 
-    def play(self, run: dict[str, Any], topology) -> None:
-        self._load_network(topology, run.get("links") or [])
+    def play(self, run: dict[str, Any]) -> None:
+        # Replay the recorded links and distances, even if the file was edited since the run.
+        self.links = self.canvas.links
+        if recorded := run.get("links"):
+            stations = {link_name(e["a"], e["b"]): e["has_bsm"] for e in self.canvas.links}
+            self.links = [
+                {**link, "has_bsm": stations.get(link_name(link["a"], link["b"]), True)}
+                for link in recorded if link["a"] in self.canvas.positions and link["b"] in self.canvas.positions
+            ]
+        self._adjacent = {link_name(link["a"], link["b"]) for link in self.links}
         self.run = run
         self.waiting_since = None
         self.labels = [f"Trial {n}: {t.get('label', 'Run')}" for n, t in enumerate(run.get("trials", []), start=1)]
         self.trial_box.configure(values=["All trials", *self.labels])
         self.trial_choice.set("All trials")
         self.speed.set(self.speed.get() or "1x")
-        self._show()
         self.restart()
+        self._show()
 
     def restart(self) -> None:
         if self.run is None:
@@ -381,9 +367,11 @@ class PathReplay:
             self._timer = None
         self.playing = False
         self.waiting_since = None
-        self.canvas.grid_remove()
+        self.canvas.overlay = None
         self.controls.grid_remove()
-        self.cover.grid()
+        self.steps = []
+        self.run = None
+        self.canvas.reset_view()
 
     def apply_theme(self, colors: Palette) -> None:
         self.colors = colors
@@ -394,12 +382,10 @@ class PathReplay:
     # Frame loop ------------------------------------------------------------------------
 
     def _show(self) -> None:
-        info = self.cover.grid_info()
-        if info:
-            self.cover.grid_remove()
-            self.canvas.grid(row=info["row"], column=info["column"], sticky="nsew")
+        self.canvas.overlay = self._render
         self.controls.grid()
         self.controls.winfo_toplevel().update_idletasks()
+        self.canvas.center_preview()
         self._last = time.monotonic()
         self._mark_dirty()
         if self._timer is None:
@@ -436,37 +422,6 @@ class PathReplay:
 
     # Drawing ----------------------------------------------------------------------------
 
-    def _load_network(self, topology, links: list[dict[str, Any]]) -> None:
-        self.positions = graph_positions(topology)
-        self.links = [link for link in links if link["a"] in self.positions and link["b"] in self.positions]
-        self._adjacent = {link_name(link["a"], link["b"]) for link in self.links}
-
-    def _place(self, top: float, bottom: float, right: float) -> None:
-        """Fit the layout between the caption, the legend, and the bottom line, turning it if that makes it bigger."""
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        side = 56
-        if not self.positions:
-            self._screen = {}
-            return
-        xs = [x for x, _ in self.positions.values()]
-        ys = [y for _, y in self.positions.values()]
-        span_x, span_y = max(max(xs) - min(xs), 1), max(max(ys) - min(ys), 1)
-        room_x, room_y = max(width - 2 * side - right, 50), max(height - top - bottom, 50)
-        upright = min(room_x / span_x, room_y / span_y)
-        turned = min(room_x / span_y, room_y / span_x)
-        turn = turned > upright * 1.15
-        scale = min(turned if turn else upright, 2.2)
-        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
-        mid_x, mid_y = side + room_x / 2, top + room_y / 2
-        self._screen = {}
-        for name, (x, y) in self.positions.items():
-            dx, dy = x - cx, y - cy
-            if turn:
-                dx, dy = -dy, dx
-            self._screen[name] = (mid_x + dx * scale, mid_y + dy * scale)
-        self._centre = (mid_x, mid_y)
-        self._bounds = (side - 30, top - 6, side + room_x + 30, top + room_y + 16)
-
     def _render(self) -> None:
         c = self.canvas
         c.delete("all")
@@ -480,60 +435,28 @@ class PathReplay:
         self.fonts["heading"].configure(size=13 if compact else 15)
         # Text first, then the network fitted into the space that is left.
         top = max(self._draw_header(step) + 34, 90)
-        legend = self._draw_legend(step, top) if width > 760 else 0
-        self._place(top, 40, legend)
+        legend = self.canvas.legend_width()
+        if legend:
+            self._draw_legend(top, legend)
+        self.canvas.place_network(top, 40, legend)
         route = step.route if step else ()
         if step and step.kind == "request":
             route = ()
-        self._draw_links(route, step, progress)
+        on_route = {link_name(a, b) for a, b in zip(route, route[1:])}
+        if step and step.kind == "request":
+            hops = len(step.nodes) - 1
+            done = min(hops, int(progress * hops) + 1)
+            on_route = {link_name(a, b) for a, b in zip(step.nodes[:done], step.nodes[1:done + 1])}
+        self.canvas.draw_links(self.links, on_route)
         if step:
             self._draw_pairs(step.held)
             self._draw_effect(step, progress)
-        self._draw_nodes(route, step)
+        trial = self._trial(step)
+        ends = {trial.get("source"): "source", trial.get("destination"): "destination"} if trial else {}
+        self.canvas.draw_nodes(route, ends)
         self._draw_footer()
         if step and step.kind == "title":
             self._draw_card(step)
-
-    def _draw_links(self, route: tuple[str, ...], step: Step | None, progress: float) -> None:
-        c, colors = self.canvas, self.colors
-        on_route = {link_name(a, b) for a, b in zip(route, route[1:])}
-        if step and step.kind == "request" and len(step.nodes) > 1:
-            hops = len(step.nodes) - 1
-            done = min(hops, int(progress * hops) + 1)
-            on_route = {link_name(a, b) for a, b in zip(step.nodes[:done + 1], step.nodes[1:done + 1])}
-        for link in self.links:
-            (x1, y1), (x2, y2) = self._screen[link["a"]], self._screen[link["b"]]
-            if link_name(link["a"], link["b"]) in on_route:
-                c.create_line(x1, y1, x2, y2, fill=colors.selected, width=12, capstyle="round")
-                c.create_line(x1, y1, x2, y2, fill=colors.muted, width=2)
-            else:
-                c.create_line(x1, y1, x2, y2, fill=colors.border, width=2)
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            c.create_rectangle(mx - 3, my - 3, mx + 3, my + 3, fill=colors.muted, outline="")
-            if link.get("km"):
-                dx, dy = x2 - x1, y2 - y1
-                length = math.hypot(dx, dy) or 1
-                c.create_text(mx - dy / length * 13, my + dx / length * 13, text=f"{_fmt(link['km'])} km",
-                              fill=colors.muted, font=self.fonts["small"])
-
-    def _draw_nodes(self, route: tuple[str, ...], step: Step | None) -> None:
-        c, colors = self.canvas, self.colors
-        trial = self._trial(step)
-        ends = {trial.get("source"): "source", trial.get("destination"): "destination"} if trial else {}
-        for name, (x, y) in self._screen.items():
-            r = 19
-            on_route = name in route
-            c.create_oval(x - r, y - r, x + r, y + r, fill=colors.surface,
-                          outline=colors.accent if on_route else colors.text, width=3 if name in ends else 2)
-            digits = re.search(r"\d+$", name)
-            plain = re.fullmatch(r"node\d+", name) is not None  # nodeN shows as N, like the picture's labels.
-            c.create_text(x, y, text=digits.group() if digits else name[:2], fill=colors.text,
-                          font=self.fonts["node"])
-            if name in ends:
-                c.create_text(x, y + r + 11, text=f"{name} ({ends[name]})", fill=colors.text,
-                              font=self.fonts["small"])
-            elif not plain:
-                c.create_text(x, y + r + 11, text=name, fill=colors.muted, font=self.fonts["small"])
 
     def _trial(self, step: Step | None) -> dict[str, Any]:
         if self.run is None or step is None:
@@ -543,17 +466,17 @@ class PathReplay:
 
     def _curve(self, a: str, b: str) -> tuple[list[float], tuple[float, float]]:
         """Points for a pair: straight along a link, or an arc bowing away from the middle."""
-        (x1, y1), (x2, y2) = self._screen[a], self._screen[b]
+        (x1, y1), (x2, y2) = self.canvas.screen[a], self.canvas.screen[b]
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
         if link_name(a, b) in self._adjacent:
             return [x1, y1, x2, y2], (mx, my)
         dx, dy = x2 - x1, y2 - y1
         length = math.hypot(dx, dy) or 1
         nx, ny = -dy / length, dx / length
-        cx, cy = self._centre
+        cx, cy = self.canvas.centre
         if (mx - cx) * nx + (my - cy) * ny < 0:
             nx, ny = -nx, -ny
-        left, top, right, bottom = self._bounds
+        left, top, right, bottom = self.canvas.bounds
         bow = 0.45 * length + 30
         # Bow away from the middle, unless that leaves the drawing; then bow inward or flatten.
         for _ in range(8):
@@ -567,7 +490,7 @@ class PathReplay:
 
     def _draw_pair(self, pair: Pair, colour: str, *, width: float = 4, label: bool = True,
                    count: int = 1, dashed: bool | None = None) -> None:
-        if pair.a not in self._screen or pair.b not in self._screen:
+        if pair.a not in self.canvas.screen or pair.b not in self.canvas.screen:
             return
         c = self.canvas
         points, apex = self._curve(pair.a, pair.b)
@@ -596,14 +519,14 @@ class PathReplay:
             self._draw_pair(group[-1], self.marks["pair"], count=len(group))
 
     def _ring(self, node: str, colour: str, progress: float, *, width: int = 4) -> None:
-        if node not in self._screen:
+        if node not in self.canvas.screen:
             return
-        x, y = self._screen[node]
+        x, y = self.canvas.screen[node]
         r = 24 + 12 * math.sin(math.pi * min(progress, 1.0))
         self.canvas.create_oval(x - r, y - r, x + r, y + r, outline=colour, width=width)
 
     def _point(self, a: str, b: str, fraction: float) -> tuple[float, float]:
-        (x1, y1), (x2, y2) = self._screen[a], self._screen[b]
+        (x1, y1), (x2, y2) = self.canvas.screen[a], self.canvas.screen[b]
         return x1 + (x2 - x1) * fraction, y1 + (y2 - y1) * fraction
 
     def _packet(self, x: float, y: float, label: str) -> None:
@@ -613,7 +536,7 @@ class PathReplay:
 
     def _draw_effect(self, step: Step, p: float) -> None:
         c, marks, colors = self.canvas, self.marks, self.colors
-        nodes = [n for n in step.nodes if n in self._screen]
+        nodes = [n for n in step.nodes if n in self.canvas.screen]
         kind = step.kind
         if kind == "request" and len(nodes) > 1:
             hops = len(nodes) - 1
@@ -624,7 +547,7 @@ class PathReplay:
             self._packet(*self._point(nodes[0], nodes[1], min(1.0, p / 0.8)), step.packet)
         elif kind in ("approve", "request") and nodes:
             self._ring(nodes[-1], marks["packet"], p, width=3)
-            x, y = self._screen[nodes[-1]]
+            x, y = self.canvas.screen[nodes[-1]]
             self._packet(x + 30, y - 30, step.packet)
         elif kind in ("attempt", "link_pair") and len(nodes) == 2:
             a, b = nodes
@@ -729,10 +652,9 @@ class PathReplay:
             swap_failed += earlier.kind == "swap_fail"
         return tried, failed, swap_failed
 
-    def _draw_legend(self, step: Step | None, top: float) -> float:
-        """Key down the right side, with the one line explanation under it. Returns its width."""
+    def _draw_legend(self, top: float, panel: int) -> None:
+        """Key down the right side, with the one line explanation under it."""
         c, colors, marks = self.canvas, self.colors, self.marks
-        panel = 230
         x = c.winfo_width() - panel
         items = [
             ("line", marks["pair"], "Bell pair, one qubit\nkept at each end"),
@@ -763,7 +685,6 @@ class PathReplay:
                                   font=self.fonts["small"], text=EXPLAINER)
         if c.bbox(explainer)[3] > c.winfo_height() - 30:
             c.delete(explainer)  # The title card says it too, so drop it when space is short.
-        return panel
 
     def _draw_footer(self) -> None:
         c, colors = self.canvas, self.colors
@@ -776,7 +697,7 @@ class PathReplay:
 
     def _draw_card(self, step: Step) -> None:
         c, colors = self.canvas, self.colors
-        left, top, right, bottom = self._bounds
+        left, top, right, bottom = self.canvas.bounds
         card_width = min(600, right - left + 20)
         title = step.title
         body = step.caption

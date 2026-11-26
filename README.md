@@ -8,6 +8,8 @@ Requires Python with SeQUeNCe, Pillow, and Tk, plus Graphviz (`dot`).
 
 Double-click `start.cmd` on Windows or run `python app.py`. Choose **Load file** to open a topology.
 
+The topology preview uses the experiment replay’s node layout, link distances in kilometres, and small square markers for Bell-state measurement (BSM) stations. **Show BSM nodes** expands those markers in either view.
+
 ## 9 node experiment
 
 Double-click **9 node topology.json** in the sidebar, then click **Run test**. The console shows the route and the number of entangled pairs delivered with default and upgraded hardware.
