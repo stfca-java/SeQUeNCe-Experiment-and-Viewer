@@ -42,6 +42,8 @@ GLOSSARY = (
 # Categorical colours from the reference data palette (fixed order, light and dark steps).
 SERIES_LIGHT = ["#257de0", "#f47230", "#00b894", "#f2a600", "#ee7fac", "#008a17", "#6a4ce2", "#ec4647"]
 SERIES_DARK = ["#338ced", "#e76624", "#00a888", "#d28e05", "#e24d8b", "#0aac23", "#9887ef", "#eb6263"]
+# Tint for the "good enough to use" band on chart 4; the "too noisy" band uses the error colour.
+GOOD_LIGHT, GOOD_DARK = "#008a17", "#0aac23"
 
 
 def trial_colours(labels: list[str], dark: bool) -> dict[str, str]:
@@ -234,50 +236,56 @@ def _chart_links(ax, run: dict[str, Any], colors: Palette, colour: dict[str, str
 
 
 def _chart_fidelity(ax, run: dict[str, Any], colors: Palette, colour: dict[str, str]) -> None:
-    """Chart 4: fidelity after each swap and at delivery, against the target."""
+    """Chart 4: were the pairs good enough to use? Fidelity after each swap and at delivery, against the target."""
     trials, source, destination, window = _basics(run)
     target = trials[0].get("target_fidelity")
-    ax = _panel(ax, colors, "4. How good each pair was (fidelity)",
-                "1.0 is perfect. Each swap multiplies the fidelity of the two pairs it joins, so quality drops "
-                "with every swap." + (" Shaded = too noisy to use." if target else ""))
-    if target:
-        ax.axhspan(0.4, target, color=colors.error, alpha=0.07, linewidth=0)
-        ax.axhline(target, color=colors.muted, linestyle="--", linewidth=1)
-        ax.annotate(f"target {target:g}", (0, target), xytext=(4, 4), textcoords="offset points",
-                    fontsize=8, color=colors.muted, xycoords=("axes fraction", "data"))
-        ax.annotate("Too noisy to use", (0, 0.4), xytext=(4, 6), textcoords="offset points",
-                    fontsize=9, color=colors.muted, xycoords=("axes fraction", "data"))
+    ax = _panel(ax, colors, "4. Were the pairs good enough to use?",
+                "Fidelity is a pair's quality (1.0 = perfect). A swap joins two pairs into one longer pair, "
+                "but lowers its fidelity.")
+    key = []  # Colour per trial, then what hollow and filled dots mean.
+    lowest, any_swaps, any_deliveries = 0.5, False, False
     for trial in trials:
         swaps = [(e["t"] - trial["start_s"], e["fidelity"]) for e in trial["events"] if e["type"] == "ES_SUCCESS"]
         deliveries = [(e["t"] - trial["start_s"], e["fidelity"]) for e in _deliveries(trial)]
+        lowest = min([lowest] + [f for _, f in swaps + deliveries])
         tint = colour[trial["label"]]
         if swaps:
             ax.scatter(*zip(*swaps), s=40, facecolors="none", edgecolors=tint, linewidths=1.5)
         if deliveries:
             ax.scatter(*zip(*deliveries), s=64, color=tint, edgecolors=colors.canvas, linewidths=1.5, zorder=3)
-        low = [point for point in swaps if target and point[1] < target]
-        if low:
-            value = low[-1][1]
-            note = f"{trial['label']}: {value:.3f} after swapping"
-            memory = trial.get("memory_fidelity")
-            if memory and abs(memory * memory * _swap_keeps(trial) - value) < 0.001:
-                note = f"{trial['label']}: {memory:g} × {memory:g} × {_swap_keeps(trial):g} = {value:.3f}"
-            ax.annotate(note, low[-1], xytext=(10, 0), textcoords="offset points", va="center", fontsize=8.5,
-                        color=colors.text)
-    ax.legend(handles=[
-        Line2D([], [], marker="o", linestyle="", markersize=7, markerfacecolor="none",
-               markeredgecolor=colors.muted, label="Pair after a swap (still being built)"),
-        Line2D([], [], marker="o", linestyle="", markersize=8, markerfacecolor=colors.muted,
-               markeredgecolor=colors.canvas, label=f"Pair delivered to {source} and {destination}"),
-    ], loc="lower right", frameon=False, fontsize=9, labelcolor=colors.text)
+        if swaps or deliveries:
+            key.append(Line2D([], [], linestyle="none", marker="s", markersize=8, color=tint, label=trial["label"]))
+        any_swaps, any_deliveries = any_swaps or bool(swaps), any_deliveries or bool(deliveries)
+    if any_swaps:
+        key.append(Line2D([], [], linestyle="none", marker="o", markersize=7, markerfacecolor="none",
+                          markeredgecolor=colors.muted, markeredgewidth=1.5, label="pair after a swap"))
+    if any_deliveries:
+        key.append(Line2D([], [], linestyle="none", marker="o", markersize=8, color=colors.muted,
+                          label=f"pair delivered to {destination}"))
+    bottom = 0.5 if lowest >= 0.5 else max(0.0, lowest - 0.05)
+    if target:
+        good = GOOD_DARK if colors == DARK else GOOD_LIGHT
+        ax.axhspan(target, 1.02, color=good, alpha=0.07, linewidth=0)
+        ax.axhspan(bottom, target, color=colors.error, alpha=0.07, linewidth=0)
+        ax.axhline(target, color=colors.muted, linestyle="--", linewidth=1)
+        ax.annotate(f"Good enough to use ({target:g} or more)", (1, target), xycoords=("axes fraction", "data"),
+                    xytext=(-4, 4), textcoords="offset points", ha="right", va="bottom", fontsize=8.5,
+                    fontweight="bold", color=good)
+        ax.annotate(f"Too noisy to use (under {target:g})", (1, target), xycoords=("axes fraction", "data"),
+                    xytext=(-4, -4), textcoords="offset points", ha="right", va="top", fontsize=8.5,
+                    fontweight="bold", color=colors.error)
     ax.set_xlim(0, window)
-    ax.set_ylim(0.4, 1.0)
+    ax.set_ylim(bottom, 1.02)
     ax.set_xlabel("Seconds since the request window opened")
-    ax.set_ylabel("Fidelity (1 = perfect)")
+    ax.set_ylabel("Fidelity (1.0 = perfect)")
+    if key:
+        ax.legend(handles=key, fontsize=9, labelcolor=colors.text, loc="lower left", ncols=2 if len(key) > 2 else 1,
+                  handletextpad=0.3, columnspacing=1.2, frameon=True, facecolor=colors.canvas, edgecolor="none",
+                  framealpha=0.85)
 
 
 CHARTS = ("All 4 charts", "1. Bell pairs delivered", "2. When the pairs arrived", "3. Links that failed",
-          "4. Fidelity of each pair")
+          "4. Good enough to use?")
 _DRAW = (_chart_delivered, _chart_timeline, _chart_links, _chart_fidelity)
 
 
