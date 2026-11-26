@@ -1,0 +1,342 @@
+{
+  "nodes": [
+    {
+      "name": "node0",
+      "type": "QuantumRouter",
+      "seed": 0,
+      "memo_size": 50
+    },
+    {
+      "name": "node1",
+      "type": "QuantumRouter",
+      "seed": 1,
+      "memo_size": 50
+    },
+    {
+      "name": "node2",
+      "type": "QuantumRouter",
+      "seed": 2,
+      "memo_size": 50
+    },
+    {
+      "name": "node3",
+      "type": "QuantumRouter",
+      "seed": 3,
+      "memo_size": 50
+    },
+    {
+      "name": "node4",
+      "type": "QuantumRouter",
+      "seed": 4,
+      "memo_size": 50
+    },
+    {
+      "name": "node5",
+      "type": "QuantumRouter",
+      "seed": 5,
+      "memo_size": 50
+    },
+    {
+      "name": "node6",
+      "type": "QuantumRouter",
+      "seed": 6,
+      "memo_size": 50
+    },
+    {
+      "name": "node7",
+      "type": "QuantumRouter",
+      "seed": 7,
+      "memo_size": 50
+    },
+    {
+      "name": "node8",
+      "type": "QuantumRouter",
+      "seed": 8,
+      "memo_size": 50
+    }
+  ],
+  "qconnections": [
+    {
+      "node1": "node0",
+      "node2": "node1",
+      "attenuation": 0.0002,
+      "distance": 4000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node0",
+      "node2": "node7",
+      "attenuation": 0.0002,
+      "distance": 8000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node1",
+      "node2": "node2",
+      "attenuation": 0.0002,
+      "distance": 8000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node1",
+      "node2": "node7",
+      "attenuation": 0.0002,
+      "distance": 11000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node2",
+      "node2": "node3",
+      "attenuation": 0.0002,
+      "distance": 7000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node2",
+      "node2": "node8",
+      "attenuation": 0.0002,
+      "distance": 2000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node2",
+      "node2": "node5",
+      "attenuation": 0.0002,
+      "distance": 4000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node3",
+      "node2": "node4",
+      "attenuation": 0.0002,
+      "distance": 9000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node3",
+      "node2": "node5",
+      "attenuation": 0.0002,
+      "distance": 14000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node4",
+      "node2": "node5",
+      "attenuation": 0.0002,
+      "distance": 10000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node5",
+      "node2": "node6",
+      "attenuation": 0.0002,
+      "distance": 2000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node6",
+      "node2": "node7",
+      "attenuation": 0.0002,
+      "distance": 1000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node6",
+      "node2": "node8",
+      "attenuation": 0.0002,
+      "distance": 6000,
+      "type": "meet_in_the_middle"
+    },
+    {
+      "node1": "node7",
+      "node2": "node8",
+      "attenuation": 0.0002,
+      "distance": 7000,
+      "type": "meet_in_the_middle"
+    }
+  ],
+  "cconnections": [
+    {
+      "node1": "node0",
+      "node2": "node1",
+      "delay": 4000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node2",
+      "delay": 12000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node3",
+      "delay": 19000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node4",
+      "delay": 21000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node5",
+      "delay": 11000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node6",
+      "delay": 9000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node7",
+      "delay": 8000000000
+    },
+    {
+      "node1": "node0",
+      "node2": "node8",
+      "delay": 14000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node2",
+      "delay": 8000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node3",
+      "delay": 15000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node4",
+      "delay": 22000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node5",
+      "delay": 12000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node6",
+      "delay": 12000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node7",
+      "delay": 11000000000
+    },
+    {
+      "node1": "node1",
+      "node2": "node8",
+      "delay": 10000000000
+    },
+    {
+      "node1": "node2",
+      "node2": "node3",
+      "delay": 7000000000
+    },
+    {
+      "node1": "node2",
+      "node2": "node4",
+      "delay": 14000000000
+    },
+    {
+      "node1": "node2",
+      "node2": "node5",
+      "delay": 4000000000
+    },
+    {
+      "node1": "node2",
+      "node2": "node6",
+      "delay": 6000000000
+    },
+    {
+      "node1": "node2",
+      "node2": "node7",
+      "delay": 7000000000
+    },
+    {
+      "node1": "node2",
+      "node2": "node8",
+      "delay": 2000000000
+    },
+    {
+      "node1": "node3",
+      "node2": "node4",
+      "delay": 9000000000
+    },
+    {
+      "node1": "node3",
+      "node2": "node5",
+      "delay": 11000000000
+    },
+    {
+      "node1": "node3",
+      "node2": "node6",
+      "delay": 13000000000
+    },
+    {
+      "node1": "node3",
+      "node2": "node7",
+      "delay": 14000000000
+    },
+    {
+      "node1": "node3",
+      "node2": "node8",
+      "delay": 9000000000
+    },
+    {
+      "node1": "node4",
+      "node2": "node5",
+      "delay": 10000000000
+    },
+    {
+      "node1": "node4",
+      "node2": "node6",
+      "delay": 12000000000
+    },
+    {
+      "node1": "node4",
+      "node2": "node7",
+      "delay": 13000000000
+    },
+    {
+      "node1": "node4",
+      "node2": "node8",
+      "delay": 16000000000
+    },
+    {
+      "node1": "node5",
+      "node2": "node6",
+      "delay": 2000000000
+    },
+    {
+      "node1": "node5",
+      "node2": "node7",
+      "delay": 3000000000
+    },
+    {
+      "node1": "node5",
+      "node2": "node8",
+      "delay": 6000000000
+    },
+    {
+      "node1": "node6",
+      "node2": "node7",
+      "delay": 1000000000
+    },
+    {
+      "node1": "node6",
+      "node2": "node8",
+      "delay": 6000000000
+    },
+    {
+      "node1": "node7",
+      "node2": "node8",
+      "delay": 7000000000
+    }
+  ],
+  "is_parallel": false,
+  "stop_time": 2000000000000
+}
