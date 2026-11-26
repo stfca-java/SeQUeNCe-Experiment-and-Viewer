@@ -19,6 +19,7 @@ from .experiment_runner import ExperimentButton
 from .experiments import EXPERIMENTS
 from .results import list_runs, load_run
 from .stats import StatsButton
+from .topology_generator import generate_topology_file
 
 
 TOPOLOGIES = Path(__file__).resolve().parents[1] / "topologies"
@@ -55,6 +56,9 @@ class TopologyViewer:
         ttk.Checkbutton(
             toolbar, text="Dark mode", variable=self.dark_mode, command=self.apply_theme,
         ).grid(row=0, column=4)
+        ttk.Button(
+            toolbar, text="Generate from edges…", command=self.generate_from_edges,
+        ).grid(row=0, column=5, padx=(8, 0))
 
         vertical = ttk.Panedwindow(root, orient="vertical")
         vertical.grid(row=1, column=0, sticky="nsew")
@@ -133,6 +137,20 @@ class TopologyViewer:
         )
         if filename:
             self.open_path(Path(filename))
+
+    def generate_from_edges(self) -> None:
+        """Turn an edges .txt file into a topology json in ./topologies and open it."""
+        filename = filedialog.askopenfilename(
+            parent=self.root, title="Choose an edges text file",
+            initialdir=self.browser.directory, filetypes=[("Text files", "*.txt")],
+        )
+        if not filename:
+            return
+        edges_path = Path(filename)
+        output_path = self.browser.directory / f"{edges_path.stem}.json"
+        generate_topology_file(edges_path, output_path)
+        self.browser.rescan()
+        self.open_path(output_path)
 
     def open_path(self, path: Path) -> None:
         try:
