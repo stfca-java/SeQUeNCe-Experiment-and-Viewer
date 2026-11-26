@@ -9,7 +9,7 @@ from graphviz import ExecutableNotFound
 from sequence.topology.router_net_topo import RouterNetTopo
 from sequence.topology.topology import Topology
 
-from env.draw_topo import build_graph, load_topology
+from env.draw_topo import load_topology
 from .animation import PathReplay
 from .appearance import DARK, LIGHT, style_widgets
 from .browser import TopologyBrowser
@@ -98,9 +98,9 @@ class TopologyViewer:
         ttk.Label(header, textvariable=self.filename, width=1, style="Heading.TLabel").grid(
             row=0, column=0, sticky="ew",
         )
-        self.canvas = TopologyCanvas(viewport)
+        self.canvas = TopologyCanvas(viewport, show_bsm=self.show_bsm)
         ttk.Checkbutton(
-            header, text="Fit to window", variable=self.canvas.fit, command=self.canvas.resize_graph,
+            header, text="Fit to window", variable=self.canvas.fit, command=self.canvas.reset_view,
         ).grid(row=0, column=1, padx=(8, 10))
         self.bsm_button = ttk.Checkbutton(
             header, text="Show BSM nodes", variable=self.show_bsm, command=self.redraw,
@@ -108,8 +108,7 @@ class TopologyViewer:
         self.bsm_button.grid(row=0, column=2)
         self.bsm_button.state(["disabled"])
         self.canvas.grid(row=1, column=0, sticky="nsew")
-        # Run test replays what moved through the network in place of the picture.
-        self.replay = PathReplay(viewport, self.canvas, header)
+        self.replay = PathReplay(self.canvas, header)
         self.replay.controls.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.replay.controls.grid_remove()
         horizontal = ttk.Scrollbar(viewport, orient="horizontal", command=self.canvas.xview)
@@ -139,7 +138,8 @@ class TopologyViewer:
         try:
             path = path.resolve()
             topology = load_topology(path)
-            self._draw(topology)
+            self.replay.close()
+            self.canvas.show_topology(topology)
         except Exception as error:
             self.browser.select_path(self.path)
             self._report_error(path, error)
@@ -164,22 +164,11 @@ class TopologyViewer:
             self.open_path(self.path)
 
     def redraw(self) -> None:
-        if self.topology is None or self.path is None:
-            return
-        try:
-            self._draw(self.topology)
-        except Exception as error:
-            self.show_bsm.set(not self.show_bsm.get())
-            self._report_error(self.path, error)
-
-    def _draw(self, topology: Topology) -> None:
-        self.replay.close()
-        graph = build_graph(topology, draw_middle=self.show_bsm.get())
-        self.canvas.show_png(graph.pipe())
+        self.canvas.resize_graph()
 
     def _test_started(self, path: Path) -> None:
         if self.topology is not None and path == self.path:
-            self.replay.show_waiting(self.topology, path)
+            self.replay.show_waiting()
 
     def _test_finished(self, path: Path, passed: bool, started: float) -> None:
         self.stats_button.refresh()
@@ -202,7 +191,7 @@ class TopologyViewer:
         if self.topology is None or topology_path != self.path:
             return
         try:
-            self.replay.play(run, self.topology)
+            self.replay.play(run)
         except Exception as error:
             self.replay.close()
             self.console.write(f"Couldn’t replay {results.name}. {error}\n", error=True)

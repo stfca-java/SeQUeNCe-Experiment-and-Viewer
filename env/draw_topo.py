@@ -72,18 +72,19 @@ def build_graph(topo: Topology, draw_middle: bool = False) -> Graph:
     if draw_middle or isinstance(topo, QKDTopo):
         # QKD channels connect end nodes directly in either view.
         for qchannel in topo.get_qchannels():
-            g.edge(qchannel.sender.name, qchannel.receiver, color='blue', dir='forward')
+            g.edge(qchannel.sender.name, qchannel.receiver, color='blue', dir='forward',
+                   km=str(qchannel.distance / 1000))
     else:
         # Collapse each measurement station into a single router-to-router link.
-        bsm_to_node = defaultdict(list)
+        channels_by_bsm = defaultdict(list)
         for qchannel in topo.get_qchannels():
-            node = qchannel.sender.name
-            bsm = qchannel.receiver
-            bsm_to_node[bsm].append(node)
-        for bsm, nodes in bsm_to_node.items():
-            if len(nodes) != 2:
-                raise ValueError(f"Expected two quantum channels into {bsm}, found {len(nodes)}.")
-            g.edge(nodes[0], nodes[1], color='blue')
+            channels_by_bsm[qchannel.receiver].append(qchannel)
+        for bsm, channels in channels_by_bsm.items():
+            if len(channels) != 2:
+                raise ValueError(f"Expected two quantum channels into {bsm}, found {len(channels)}.")
+            left, right = channels
+            g.edge(left.sender.name, right.sender.name, color='blue', station=bsm,
+                   km=str((left.distance + right.distance) / 1000))
 
     return g
 
