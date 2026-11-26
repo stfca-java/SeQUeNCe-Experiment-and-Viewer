@@ -79,6 +79,18 @@ def style_widgets(root: tk.Tk, colors: Palette) -> None:
         "Treeview", background=[("selected", colors.selected)],
         foreground=[("selected", colors.text)],
     )
+    style.configure(
+        "TCombobox", fieldbackground=colors.canvas, foreground=colors.text, background=colors.surface,
+        arrowcolor=colors.text, selectbackground=colors.canvas, selectforeground=colors.text,
+    )
+    style.map(
+        "TCombobox", fieldbackground=[("readonly", colors.canvas)], foreground=[("readonly", colors.text)],
+        selectbackground=[("readonly", colors.canvas)], selectforeground=[("readonly", colors.text)],
+    )
+    root.option_add("*TCombobox*Listbox.background", colors.canvas)
+    root.option_add("*TCombobox*Listbox.foreground", colors.text)
+    root.option_add("*TCombobox*Listbox.selectBackground", colors.selected)
+    root.option_add("*TCombobox*Listbox.selectForeground", colors.text)
     style.configure("TScrollbar", background=colors.border, arrowcolor=colors.muted)
     style.map("TScrollbar", background=[("active", colors.muted)])
     style.configure("Sash", sashthickness=5, gripcount=0)

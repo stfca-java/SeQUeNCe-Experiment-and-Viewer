@@ -10,12 +10,15 @@ from sequence.topology.router_net_topo import RouterNetTopo
 from sequence.topology.topology import Topology
 
 from env.draw_topo import build_graph, load_topology
+from .animation import PathReplay
 from .appearance import DARK, LIGHT, style_widgets
 from .browser import TopologyBrowser
 from .canvas import TopologyCanvas
 from .console import OutputConsole
 from .experiment_runner import ExperimentButton
 from .experiments import EXPERIMENTS
+from .results import list_runs, load_run
+from .stats import StatsButton
 
 
 TOPOLOGIES = Path(__file__).resolve().parents[1] / "topologies"
@@ -64,9 +67,16 @@ class TopologyViewer:
         self._build_viewport(viewport)
         self.console = OutputConsole(vertical)
         vertical.add(self.console, weight=0)
-        self.test_button = ExperimentButton(toolbar, self.browser.directory, self.console)
+        self.test_button = ExperimentButton(
+            toolbar, self.browser.directory, self.console,
+            on_start=self._test_started, on_finish=self._test_finished,
+        )
         self.test_button.grid(row=0, column=2, padx=(8, 0))
         self.test_button.select_path(None)
+        self.stats_button = StatsButton(
+            toolbar, lambda: DARK if self.dark_mode.get() else LIGHT, on_replay=self.play_run,
+        )
+        self.stats_button.grid(row=0, column=3, padx=(8, 0), sticky="w")
 
         footer = ttk.Frame(root, style="Footer.TFrame", padding=(12, 6))
         footer.grid(row=2, column=0, sticky="ew")
@@ -98,6 +108,10 @@ class TopologyViewer:
         self.bsm_button.grid(row=0, column=2)
         self.bsm_button.state(["disabled"])
         self.canvas.grid(row=1, column=0, sticky="nsew")
+        # Run test replays what moved through the network in place of the picture.
+        self.replay = PathReplay(viewport, self.canvas, header)
+        self.replay.controls.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.replay.controls.grid_remove()
         horizontal = ttk.Scrollbar(viewport, orient="horizontal", command=self.canvas.xview)
         vertical = ttk.Scrollbar(viewport, orient="vertical", command=self.canvas.yview)
         horizontal.grid(row=2, column=0, sticky="ew")
@@ -108,6 +122,7 @@ class TopologyViewer:
         colors = DARK if self.dark_mode.get() else LIGHT
         style_widgets(self.root, colors)
         self.canvas.apply_theme(colors)
+        self.replay.apply_theme(colors)
         self.console.apply_theme(colors)
 
     def choose_file(self) -> None:
@@ -158,8 +173,41 @@ class TopologyViewer:
             self._report_error(self.path, error)
 
     def _draw(self, topology: Topology) -> None:
+        self.replay.close()
         graph = build_graph(topology, draw_middle=self.show_bsm.get())
         self.canvas.show_png(graph.pipe())
+
+    def _test_started(self, path: Path) -> None:
+        if self.topology is not None and path == self.path:
+            self.replay.show_waiting(self.topology, path)
+
+    def _test_finished(self, path: Path, passed: bool, started: float) -> None:
+        self.stats_button.refresh()
+        runs = [run for run in list_runs(path.name) if run.stat().st_mtime >= started - 1]
+        if passed and runs and path == self.path:
+            self.play_run(runs[0])
+        elif self.replay.waiting:
+            self.replay.close()
+
+    def play_run(self, results: Path) -> None:
+        """Replay a saved run on its topology, slowly, in place of the picture."""
+        try:
+            run = load_run(results)
+            topology_path = (self.browser.directory / run["topology"]).resolve()
+        except (OSError, ValueError, KeyError) as error:
+            self.console.write(f"Couldn’t replay {results.name}. {error}\n", error=True)
+            return
+        if topology_path != self.path:
+            self.open_path(topology_path)
+        if self.topology is None or topology_path != self.path:
+            return
+        try:
+            self.replay.play(run, self.topology)
+        except Exception as error:
+            self.replay.close()
+            self.console.write(f"Couldn’t replay {results.name}. {error}\n", error=True)
+            return
+        self.console.write(f"Replaying {results.name}. Click the picture to pause or play.\n")
 
     def _report_error(self, path: Path, error: Exception) -> None:
         self.status.set("Couldn’t display topology")
