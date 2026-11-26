@@ -20,6 +20,6 @@ After **Run test** finishes, the viewer replays the run slowly in place of the p
 
 ## Stats
 
-**Show stats** charts the newest run: Bell pairs delivered, delivered over time, the share of link attempts that failed on each link of the Dijkstra path, and fidelity after swaps and at delivery. Pick an older run or **Compare all runs** from the list, save the charts as a PNG, or replay a run in the viewer. It also runs on its own: `python -m modules.stats`, or `python -m modules.stats --save charts.png`.
+**Show stats** charts the newest run: Bell pairs delivered, delivered over time, the share of link attempts that failed on each link of the Dijkstra path, and fidelity after swaps and at delivery. Each chart says in plain words how to read it, for an audience new to quantum networks, and **Show** picks one chart at a time to walk through. Pick an older run or **Compare all runs** from the list, save the charts as a PNG, or replay a run in the viewer. It also runs on its own: `python -m modules.stats`, or `python -m modules.stats --save charts.png`.
 
 [SeQUeNCe license](env/LICENSE-SeQUeNCe)
