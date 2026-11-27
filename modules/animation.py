@@ -6,16 +6,20 @@ pair between the two ends. The replay steps through SeQUeNCe's own event log in
 order, one event at a time, with the simulated clock in the corner. The only
 things drawn moving along the links are the REQUEST and APPROVE messages that book
 memory on the path Dijkstra picked.
+
+A trial that purifies makes thousands of events, far too many to replay one by one.
+Its replay goes one fidelity level at a time instead: link pairs, each swap, and each
+purify round, with a meter that shows the fidelity climbing to the target.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import time
 import tkinter as tk
 from tkinter import font, ttk
-from typing import Any
+from typing import Any, NamedTuple
 
 from .appearance import DARK, LIGHT, Palette
 from .canvas import TopologyCanvas
@@ -23,17 +27,21 @@ from .results import link_name
 
 EXPLAINER = ("Bell pairs are made link by link, then swaps join them into one end to end pair. "
              "No qubit travels the whole route.")
+PURIFY_EXPLAINER = ("Purifying uses up one Bell pair to raise the fidelity of another: two pairs go in, one "
+                    "better pair comes out. SeQUeNCe repeats it until the pair reaches the target.")
 SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0, "4x": 4.0}
 FRAME_MS = 33
+METER_WIDTH = 160  # Space left of the network for the fidelity meter.
 
 # Seconds each kind of step stays on screen at 1x.
 DURATION = {
     "title": 3.0, "waiting": 1.0, "request": 0.8, "approve": 0.9, "reject": 2.5, "window": 2.4,
     "attempt": 0.7, "link_pair": 1.3, "swap": 2.2, "swap_fail": 1.8, "purify": 2.0,
-    "purify_fail": 1.8, "deliver": 3.0, "expire": 1.5, "end": 5.0,
+    "purify_fail": 1.8, "deliver": 3.0, "expire": 1.5, "end": 5.0, "links": 3.2, "cost": 11.0,
 }
 
 # Mark colours from the reference data palette, stepped for each surface.
+GOOD = {"light": "#008a17", "dark": "#0aac23"}  # Same green as the "good enough to use" zone on chart 4.
 SERIES = {
     "light": {"pair": "#6a4ce2", "delivered": "#008a17", "swap": "#f47230", "packet": "#f2a600"},
     "dark": {"pair": "#9887ef", "delivered": "#0aac23", "swap": "#e76624", "packet": "#d28e05"},
@@ -45,9 +53,20 @@ class Pair:
     a: str
     b: str
     fidelity: float
+    cost: int = field(default=1, compare=False)  # Fewest link pairs it takes to make this pair.
 
     def joins(self, x: str, y: str) -> bool:
         return {self.a, self.b} == {x, y}
+
+
+class Tally(NamedTuple):
+    """Running counts shown in the corner while a purifying trial replays."""
+    tried: int = 0
+    failed: int = 0
+    swaps: int = 0
+    swaps_failed: int = 0
+    purified: int = 0
+    purify_failed: int = 0
 
 
 @dataclass(frozen=True)
@@ -65,23 +84,50 @@ class Step:
     route: tuple[str, ...] = ()
     packet: str = ""
     title: str = ""
+    middles: tuple[str, ...] = ()            # routers that swap in this step
+    tally: Tally | None = None               # counts so far, when the steps are grouped
+    levels: tuple[float, ...] | None = None  # fidelity levels reached so far; None hides the meter
+    seconds: float | None = None             # how long to show it at 1x, if not the usual time
 
     @property
     def duration(self) -> float:
+        if self.seconds is not None:
+            return self.seconds
         hops = max(1, len(self.nodes) - 1) if self.kind == "request" else 1
         return DURATION[self.kind] * hops
+
+
+def _blend(colour: str, base: str, amount: float) -> str:
+    """Mix ``amount`` of ``base`` into ``colour``, for a light tint that works on both themes."""
+    ours = [int(colour[i:i + 2], 16) for i in (1, 3, 5)]
+    theirs = [int(base[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(ours, theirs))
 
 
 def _fmt(value: float) -> str:
     return f"{value:g}"
 
 
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _plural(count: int, word: str, many: str | None = None) -> str:
+    return f"{count:,} {word if count == 1 else (many or word + 's')}"
+
+
+def purifies(trial: dict[str, Any]) -> bool:
+    """Trials that purify are replayed one fidelity level at a time."""
+    return bool(trial.get("purify") or (trial.get("purifications") or {}).get("success"))
+
+
 class _TrialSteps:
     """Turn one trial's event log into replay steps, tracking which pairs exist."""
 
-    def __init__(self, trial: dict[str, Any], number: int, total: int):
+    def __init__(self, trial: dict[str, Any], number: int, total: int, others: list[dict[str, Any]] = ()):
         self.trial = trial
         self.number = number
+        self.others = others  # The run's other trials, to compare costs against.
         self.steps: list[Step] = []
         self.pairs: list[Pair] = []
         self.delivered = 0
@@ -89,8 +135,16 @@ class _TrialSteps:
         self.source = trial.get("source", "")
         self.destination = trial.get("destination", "")
         self.target = trial.get("target_fidelity")
+        self.story = purifies(trial)
+        self.levels: list[float] = []
+        self.tally = Tally()
+        self._approver: str | None = None
+        self._where: dict[str, int] = {}
         self._title(f"Trial {number} of {total}: {trial.get('label', 'Run')}", self._settings())
-        self._quantum()
+        if self.story:
+            self._story()
+        else:
+            self._quantum()
 
     def _settings(self) -> str:
         trial = self.trial
@@ -98,9 +152,12 @@ class _TrialSteps:
         hardware = (f" Memory fidelity {_fmt(trial['memory_fidelity'])}, swap degradation "
                     f"{_fmt(swap) if swap is not None else 'left at the SeQUeNCe default'}."
                     if "memory_fidelity" in trial else "")
-        return (f"{self.source} asks for Bell pairs with {self.destination} from {_fmt(trial.get('start_s', 0))} s "
-                f"to {_fmt(trial.get('end_s', 0))} s, {trial.get('memories', 1)} memory per router, fidelity at "
-                f"least {_fmt(self.target)}.{hardware}\n\n{EXPLAINER}")
+        memories = trial.get("memories", 1)
+        text = (f"{self.source} asks for Bell pairs with {self.destination} from {_fmt(trial.get('start_s', 0))} s "
+                f"to {_fmt(trial.get('end_s', 0))} s, {_plural(memories, 'memory', 'memories')} per router, "
+                f"fidelity at least {_fmt(self.target)}.{hardware}\n\n")
+        # Trials that purify explain purifying instead; the trials before them already explained swaps.
+        return text + (PURIFY_EXPLAINER if self.story else EXPLAINER)
 
     # Each step records the pairs before it changes them so it can draw the change.
     def add(self, kind: str, caption: str, *, consumed=(), produced=(), **fields) -> None:
@@ -109,6 +166,9 @@ class _TrialSteps:
                 self.pairs.remove(pair)
         held = tuple(self.pairs)
         self.pairs.extend(produced)
+        if self.story:
+            fields.setdefault("levels", tuple(self.levels))
+            fields.setdefault("tally", self.tally)
         self.steps.append(Step(kind, caption, self.number, held=held, consumed=tuple(consumed),
                                produced=tuple(produced), delivered=self.delivered, route=self.route, **fields))
 
@@ -119,14 +179,41 @@ class _TrialSteps:
         return None
 
     def _title(self, title: str, subtitle: str) -> None:
-        self.steps.append(Step("title", subtitle, self.number, title=title))
+        self.steps.append(Step("title", subtitle, self.number, title=title,
+                               levels=() if self.story else None, seconds=6.0 if self.story else None))
+
+    def _book(self, event: dict[str, Any], route: tuple[str, ...]) -> None:
+        """REQUEST and APPROVE messages that book memory on the Dijkstra path."""
+        kind, node, t = event["type"], event["node"], event["t"]
+        if kind == "RESERVATION_REQUESTED":
+            hops = route if route else (node,)
+            self.add("request", f"{node} asks the network for Bell pairs with {event['responder']}. "
+                     "A REQUEST message books memory at each router on the path Dijkstra picked "
+                     "(shortest total km).",
+                     t=t, nodes=hops, packet="REQUEST")
+            self.route = route
+        elif kind == "RESERVATION_APPROVED":
+            if node == event["responder"]:
+                caption = f"{node} accepts and sends an APPROVE packet back along the same path."
+            elif node == event["initiator"]:
+                km = self.trial.get("path_km")
+                caption = (f"{node} gets the APPROVE. The Dijkstra path is booked: {', '.join(event['path'])}"
+                           + (f" ({_fmt(km)} km)." if km else "."))
+            else:
+                caption = f"APPROVE reaches {node}. It sets its rules for making and swapping pairs."
+            nodes = (self._approver, node) if self._approver else (node,)
+            self.route = tuple(event["path"]) or self.route
+            self.add("approve", caption, t=t, nodes=nodes, packet="APPROVE")
+            self._approver = node
+        elif kind in ("RESERVATION_REJECTED", "RESERVATION_HOP_REJECT"):
+            self.add("reject", f"The request is rejected at {node}: not enough free memory on the path.",
+                     t=t, nodes=(node,))
 
     def _quantum(self) -> None:
         trial = self.trial
         route = tuple(trial.get("path") or ())
         start, end = trial.get("start_s", 0), trial.get("end_s", 0)
         window_open = False
-        approver: str | None = None
         for event in trial.get("events", []):
             kind, node, t = event["type"], event["node"], event["t"]
             if not window_open and t >= start and kind not in ("RESERVATION_APPROVED", "RESERVATION_REQUESTED"):
@@ -136,29 +223,8 @@ class _TrialSteps:
             if kind in ("EG_SUCCESS", "EG_FAILURE", "EP_SUCCESS", "EP_FAILURE") and node > remote:
                 continue  # Both ends report the same attempt. Show it once.
 
-            if kind == "RESERVATION_REQUESTED":
-                hops = route if route else (node,)
-                self.add("request", f"{node} asks the network for Bell pairs with {event['responder']}. "
-                         "A REQUEST message books memory at each router on the path Dijkstra picked "
-                         "(shortest total km).",
-                         t=t, nodes=hops, packet="REQUEST")
-                self.route = route
-            elif kind == "RESERVATION_APPROVED":
-                if node == event["responder"]:
-                    caption = f"{node} accepts and sends an APPROVE packet back along the same path."
-                elif node == event["initiator"]:
-                    km = trial.get("path_km")
-                    caption = (f"{node} gets the APPROVE. The Dijkstra path is booked: {', '.join(event['path'])}"
-                               + (f" ({_fmt(km)} km)." if km else "."))
-                else:
-                    caption = f"APPROVE reaches {node}. It sets its rules for making and swapping pairs."
-                nodes = (approver, node) if approver else (node,)
-                self.route = tuple(event["path"]) or self.route
-                self.add("approve", caption, t=t, nodes=nodes, packet="APPROVE")
-                approver = node
-            elif kind in ("RESERVATION_REJECTED", "RESERVATION_HOP_REJECT"):
-                self.add("reject", f"The request is rejected at {node}: not enough free memory on the path.",
-                         t=t, nodes=(node,))
+            if kind.startswith("RESERVATION_"):
+                self._book(event, route)
             elif kind == "EG_FAILURE":
                 self.add("attempt", f"{node} and {remote} each send a photon to the middle station. No herald "
                          "this time (a photon was lost or the middle measurement failed), so they try again.",
@@ -240,6 +306,194 @@ class _TrialSteps:
             caption += " Pairs still in memory are released when the request ends."
         self.add("end", caption, t=end, title=f"{delivered} Bell pair{'s' if delivered != 1 else ''} delivered")
 
+    # A trial that purifies: one step per fidelity level ------------------------------
+
+    def _story(self) -> None:
+        """Group the events by what they make (link pairs, a swap, a purify round) and the fidelity it reaches.
+
+        Every pair at the same level has the same fidelity, so each group is one step, shown in the order
+        each level was first reached, up to the first pair delivered. Later deliveries get a step each.
+        """
+        trial = self.trial
+        route = tuple(trial.get("path") or ())
+        start, end = trial.get("start_s", 0), trial.get("end_s", 0)
+        events = trial.get("events", [])
+        for event in events:
+            if event["type"].startswith("RESERVATION_"):
+                self._book(event, route)
+        self._window(start)
+
+        where = self._where = {node: index for index, node in enumerate(route)}
+
+        def span(a: str, b: str) -> int:
+            return abs(where.get(a, 0) - where.get(b, 0))
+
+        counts = Tally()
+        stages: dict[tuple, dict[str, Any]] = {}
+        deliveries: list[tuple[dict[str, Any], Tally]] = []
+        for event in events:
+            kind, node, remote = event["type"], event["node"], event.get("remote_node", "")
+            if kind in ("EG_SUCCESS", "EG_FAILURE", "EP_SUCCESS", "EP_FAILURE") and node > remote:
+                continue  # Both ends report the same attempt. Count it once.
+            key = member = None
+            if kind in ("EG_SUCCESS", "EG_FAILURE"):
+                counts = counts._replace(tried=counts.tried + 1, failed=counts.failed + (kind == "EG_FAILURE"))
+                if kind == "EG_SUCCESS":
+                    key, member = ("links", round(event["fidelity"], 4), 1), (node, remote)
+            elif kind in ("ES_SUCCESS", "ES_FAILURE"):
+                counts = counts._replace(swaps=counts.swaps + 1,
+                                         swaps_failed=counts.swaps_failed + (kind == "ES_FAILURE"))
+                if kind == "ES_SUCCESS":
+                    left, right = event["left_node"], event["right_node"]
+                    key, member = ("swap", round(event["fidelity"], 4), span(left, right)), (node, left, right)
+            elif kind in ("EP_SUCCESS", "EP_FAILURE"):
+                counts = counts._replace(purified=counts.purified + 1,
+                                         purify_failed=counts.purify_failed + (kind == "EP_FAILURE"))
+                if kind == "EP_SUCCESS":
+                    key, member = ("purify", round(event["fidelity"], 4), span(node, remote)), (node, remote)
+            elif kind == "DELIVERY" and node == self.source:
+                deliveries.append((event, counts))
+            if key is not None and not deliveries:
+                stage = stages.setdefault(key, {"kind": key[0], "fidelity": event["fidelity"], "t": event["t"],
+                                                "members": [], "tally": counts})
+                if member not in stage["members"]:
+                    stage["members"].append(member)
+
+        ordered = list(stages.values())
+        for stage in ordered:
+            self.tally = stage["tally"]
+            if stage["kind"] == "links":
+                self._story_links(stage, where)
+            elif stage["kind"] == "swap":
+                self._story_swap(stage)
+            else:
+                same = [s for s in ordered if s["kind"] == "purify" and self._links(s) == self._links(stage)]
+                self._story_purify(stage, same.index(stage) + 1, len(same))
+        for number, (event, tally) in enumerate(deliveries):
+            self.tally = tally
+            self._story_deliver(event, first=number == 0)
+        self.tally = counts
+        self._story_end(end)
+
+    @staticmethod
+    def _links(stage: dict[str, Any]) -> frozenset[str]:
+        return frozenset(link_name(a, b) for a, b in stage["members"])
+
+    def _span(self, a: str, b: str) -> str:
+        """Name a pair from the source side of the path to the destination side."""
+        if self._where.get(a, 0) > self._where.get(b, 0):
+            a, b = b, a
+        return f"{a} to {b}"
+
+    def _status(self, fidelity: float, under: str, over: str) -> str:
+        if self.target is None:
+            return ""
+        if fidelity < self.target:
+            return f" That is under the {_fmt(self.target)} target, so {under}."
+        return f" That is {_fmt(self.target)} or more, so {over}."
+
+    def _story_links(self, stage: dict[str, Any], where: dict[str, int]) -> None:
+        fidelity = stage["fidelity"]
+        members = sorted(stage["members"], key=lambda m: min(where.get(m[0], 0), where.get(m[1], 0)))
+        pairs = tuple(Pair(a, b, fidelity) for a, b in members)
+        memories = self.trial.get("memories", 1)
+        caption = (f"Every link on the path makes Bell pairs with fidelity {fidelity:.2f}."
+                   + self._status(fidelity, "they purify first", "they can be swapped straight away")
+                   + f" Each router keeps up to {_plural(memories, 'pair')}, so it has spares to purify with.")
+        self.add("links", caption, t=stage["t"], nodes=tuple(n for m in members for n in m), fidelity=fidelity,
+                 produced=pairs)
+        self.levels.append(fidelity)
+
+    def _story_swap(self, stage: dict[str, Any]) -> None:
+        fidelity = stage["fidelity"]
+        consumed, produced = [], []
+        for middle, left, right in stage["members"]:
+            used = [p for p in (self.take(middle, left), self.take(middle, right)) if p]
+            consumed.extend(used)
+            produced.append(Pair(left, right, fidelity, cost=sum(p.cost for p in used) or 2))
+        middles = [m for m, _, _ in stage["members"]]
+        spans = [self._span(left, right) for _, left, right in stage["members"]]
+        caption = (f"{_and(middles)} swap{'s' if len(middles) == 1 else ''}. Now there "
+                   f"{'is a pair' if len(spans) == 1 else 'are pairs'} from {_and(spans)}, "
+                   f"but swapping lowers fidelity to {fidelity:.3f}."
+                   + self._status(fidelity, "they purify", "they can be swapped again or used"))
+        self.add("swap", caption, t=stage["t"], nodes=tuple(middles), middles=tuple(middles),
+                 fidelity=fidelity, consumed=tuple(consumed), produced=tuple(produced), seconds=3.4)
+        self.levels.append(fidelity)
+
+    def _story_purify(self, stage: dict[str, Any], round_: int, rounds: int) -> None:
+        fidelity = stage["fidelity"]
+        consumed, produced, before = [], [], None
+        for a, b in stage["members"]:
+            old = self.take(a, b)
+            if old is not None:
+                before = old.fidelity
+                consumed.extend((old, old))  # Drawn as the two pairs that go in.
+            produced.append(Pair(a, b, fidelity, cost=2 * old.cost if old else 2))
+        spans = _and([self._span(a, b) for a, b in stage["members"]])
+        made = (f"two pairs at {before:.3f} become one pair at {fidelity:.3f}" if before is not None
+                else f"two pairs become one pair at {fidelity:.3f}")
+        caption = f"Purify round {round_} of {rounds} on {spans}: {made}."
+        if round_ == 1:
+            caption += " If the check fails, both pairs are thrown away."
+        if self.target is not None and fidelity < self.target:
+            caption += f" Still under {_fmt(self.target)}, so they purify again."
+        elif self.target is not None:
+            caption += (f" That is {_fmt(self.target)} or more, so purifying stops. {rounds} round"
+                        f"{'s' if rounds != 1 else ''} turned {2 ** rounds} pairs into 1.")
+        self.add("purify", caption, t=stage["t"], nodes=tuple(n for m in stage["members"] for n in m),
+                 fidelity=fidelity, consumed=tuple(consumed), produced=tuple(produced), seconds=3.6)
+        self.levels.append(fidelity)
+
+    def _story_deliver(self, event: dict[str, Any], *, first: bool) -> None:
+        fidelity, t = event["fidelity"], event["t"]
+        pair = self.take(self.source, self.destination) or Pair(self.source, self.destination, fidelity)
+        self.delivered += 1
+        if first:
+            caption = (f"Delivered: {self.source} and {self.destination} share a Bell pair with fidelity "
+                       f"{fidelity:.3f}, good enough to use. It arrived {t - self.trial.get('start_s', 0):.1f} s "
+                       "after the window opened.")
+        else:
+            caption = (f"More rounds bring another pair to {_fmt(self.target)} or more. Delivered with fidelity "
+                       f"{fidelity:.3f}. Count: {self.delivered}.")
+        self.add("deliver", caption, t=t, nodes=(self.source, self.destination), fidelity=fidelity,
+                 consumed=(pair,))
+        if not self.levels or self.levels[-1] != fidelity:
+            self.levels.append(fidelity)
+        if first:
+            self._story_cost(t, pair)
+
+    def _story_cost(self, t: float, pair: Pair) -> None:
+        tally = self.tally
+        made = tally.tried - tally.failed
+        lines = [
+            f"Link pairs made: {made:,} (from {tally.tried:,} photon tries)",
+            f"Swaps: {tally.swaps:,}    Purifications: {tally.purified:,} ({tally.purify_failed:,} failed)",
+            f"With no failures at all it would still need {pair.cost:,} link pairs.",
+        ]
+        for number, other in enumerate(self.others, start=1):
+            if other is self.trial or purifies(other) or not other.get("delivered"):
+                continue
+            pairs_made = sum(v.get("successes", 0) for v in other.get("link_attempts", {}).values())
+            lines.append(f"Trial {number} needed about {pairs_made / other['delivered']:.1f} link pairs "
+                         "per usable pair.")
+        lines.append(f"Each router held up to {_plural(self.trial.get('memories', 1), 'pair')} at once.")
+        self.add("cost", "\n".join(lines), t=t, title="What 1 usable pair cost")
+
+    def _story_end(self, end: float) -> None:
+        delivered = self.delivered
+        caption = f"Window closed at {_fmt(end)} s. {_plural(delivered, 'Bell pair')} delivered"
+        fidelity = self.trial.get("mean_fidelity")
+        caption += f", fidelity {fidelity:.3f}." if delivered and fidelity else "."
+        made = self.tally.tried - self.tally.failed
+        if delivered:
+            caption += (" Purifying made the default hardware good enough to use, but it took "
+                        f"{_plural(self.trial.get('memories', 1), 'memory', 'memories')} per router and "
+                        f"{made:,} link pairs.")
+        elif self.target is not None:
+            caption += f" No pair reached {_fmt(self.target)} before the window closed."
+        self.add("end", caption, t=end, title=f"{_plural(delivered, 'Bell pair')} delivered")
+
 
 def build_steps(run: dict[str, Any], choice: int | None = None) -> list[Step]:
     """Steps for every trial in the run, or only trial number ``choice``."""
@@ -247,7 +501,7 @@ def build_steps(run: dict[str, Any], choice: int | None = None) -> list[Step]:
     steps: list[Step] = []
     for number, trial in enumerate(trials, start=1):
         if choice is None or choice == number:
-            steps.extend(_TrialSteps(trial, number, len(trials)).steps)
+            steps.extend(_TrialSteps(trial, number, len(trials), trials).steps)
     return steps
 
 
@@ -259,6 +513,7 @@ class PathReplay:
         self.controls = ttk.Frame(controls_parent)
         self.colors: Palette = LIGHT
         self.marks = SERIES["light"]
+        self.good = GOOD["light"]
         self.run: dict[str, Any] | None = None
         self.labels: list[str] = []
         self.steps: list[Step] = []
@@ -376,6 +631,7 @@ class PathReplay:
     def apply_theme(self, colors: Palette) -> None:
         self.colors = colors
         self.marks = SERIES["dark" if colors == DARK else "light"]
+        self.good = GOOD["dark" if colors == DARK else "light"]
         self.canvas.configure(background=colors.canvas)
         self._mark_dirty()
 
@@ -437,8 +693,9 @@ class PathReplay:
         top = max(self._draw_header(step) + 34, 90)
         legend = self.canvas.legend_width()
         if legend:
-            self._draw_legend(top, legend)
-        self.canvas.place_network(top, 40, legend)
+            self._draw_legend(top, legend, step)
+        meter = step is not None and step.levels is not None
+        self.canvas.place_network(top, 40, legend, left=METER_WIDTH if meter else 0)
         route = step.route if step else ()
         if step and step.kind == "request":
             route = ()
@@ -454,8 +711,10 @@ class PathReplay:
         trial = self._trial(step)
         ends = {trial.get("source"): "source", trial.get("destination"): "destination"} if trial else {}
         self.canvas.draw_nodes(route, ends)
+        if meter:
+            self._draw_meter(step, progress, top)
         self._draw_footer()
-        if step and step.kind == "title":
+        if step and step.kind in ("title", "cost"):
             self._draw_card(step)
 
     def _trial(self, step: Step | None) -> dict[str, Any]:
@@ -488,12 +747,19 @@ class PathReplay:
             bow *= 0.75
         return [x1, y1, mx + nx * bow, my + ny * bow, x2, y2], (mx + nx * bow / 2, my + ny * bow / 2)
 
-    def _draw_pair(self, pair: Pair, colour: str, *, width: float = 4, label: bool = True,
-                   count: int = 1, dashed: bool | None = None) -> None:
+    def _draw_pair(self, pair: Pair, colour: str, *, width: float = 4, label: bool | str = True,
+                   count: int = 1, dashed: bool | None = None, shift: float = 0) -> None:
         if pair.a not in self.canvas.screen or pair.b not in self.canvas.screen:
             return
         c = self.canvas
         points, apex = self._curve(pair.a, pair.b)
+        if shift:
+            # Move the whole line sideways, so two pairs on the same ends sit next to each other.
+            (x1, y1), (x2, y2) = self.canvas.screen[pair.a], self.canvas.screen[pair.b]
+            length = math.hypot(x2 - x1, y2 - y1) or 1
+            nx, ny = -(y2 - y1) / length * shift, (x2 - x1) / length * shift
+            points = [value + (nx if index % 2 == 0 else ny) for index, value in enumerate(points)]
+            apex = (apex[0] + nx, apex[1] + ny)
         target = self._trial(self.steps[self.index] if self.steps else None).get("target_fidelity")
         low = target is not None and pair.fidelity < target
         dash = (8, 6) if (low if dashed is None else dashed) else ()
@@ -503,7 +769,14 @@ class PathReplay:
             length = math.hypot(dx, dy) or 1
             qx, qy = end[0] + dx / length * 25, end[1] + dy / length * 25
             c.create_oval(qx - 5, qy - 5, qx + 5, qy + 5, fill=colour, outline=self.colors.canvas, width=2)
-        if label and len(points) > 4:
+        if isinstance(label, str):
+            # Put the words on the outside of the curve so the line does not cross them.
+            mx, my = (points[0] + points[-2]) / 2, (points[1] + points[-1]) / 2
+            dx, dy = apex[0] - mx, apex[1] - my
+            length = math.hypot(dx, dy)
+            ox, oy = (dx / length * 22, dy / length * 16) if length > 1 else (0, -14)
+            c.create_text(apex[0] + ox, apex[1] + oy, text=label, fill=self.colors.text, font=self.fonts["small"])
+        elif label and len(points) > 4:
             text = f"F {pair.fidelity:.3f}" + (" (below target)" if low else "")
             if count > 1:
                 text += f"  x{count}"
@@ -535,7 +808,7 @@ class PathReplay:
         c.create_text(x, y - 18, text=label, fill=self.colors.text, font=self.fonts["small"])
 
     def _draw_effect(self, step: Step, p: float) -> None:
-        c, marks, colors = self.canvas, self.marks, self.colors
+        marks, colors = self.marks, self.colors
         nodes = [n for n in step.nodes if n in self.canvas.screen]
         kind = step.kind
         if kind == "request" and len(nodes) > 1:
@@ -550,42 +823,39 @@ class PathReplay:
             x, y = self.canvas.screen[nodes[-1]]
             self._packet(x + 30, y - 30, step.packet)
         elif kind in ("attempt", "link_pair") and len(nodes) == 2:
-            a, b = nodes
-            travel = min(1.0, p / 0.5)
-            for end in (a, b):
-                if p < 0.55:
-                    x, y = self._point(end, b if end == a else a, 0.5 * travel)
-                    c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=marks["pair"], outline="")
-            mx, my = self._point(a, b, 0.5)
-            if kind == "attempt" and p >= 0.5:
-                c.create_line(mx - 8, my - 8, mx + 8, my + 8, fill=colors.error, width=3)
-                c.create_line(mx - 8, my + 8, mx + 8, my - 8, fill=colors.error, width=3)
-            elif kind == "link_pair" and p >= 0.5:
-                grow = min(1.0, (p - 0.5) / 0.35)
-                (x1, y1), (x2, y2) = self._point(a, b, 0.5 - grow / 2), self._point(a, b, 0.5 + grow / 2)
-                c.create_line(x1, y1, x2, y2, fill=marks["pair"], width=4)
-                if grow >= 1.0:
-                    self._draw_pair(step.produced[0], marks["pair"])
-                if p < 0.7:
-                    c.create_oval(mx - 10, my - 10, mx + 10, my + 10, outline=marks["pair"], width=3)
+            self._draw_herald(nodes[0], nodes[1], p, step.produced[0] if kind == "link_pair" else None)
+        elif kind == "links":
+            for pair in step.produced:
+                if pair.a in self.canvas.screen and pair.b in self.canvas.screen:
+                    self._draw_herald(pair.a, pair.b, p, pair)
         elif kind in ("swap", "swap_fail") and nodes:
-            middle = nodes[0]
             failed = kind == "swap_fail"
             if p < 0.5 or failed:
                 for pair in step.consumed:
                     self._draw_pair(pair, colors.error if failed and p > 0.3 else marks["pair"], label=False)
-            self._ring(middle, colors.error if failed else marks["swap"], min(1.0, p * 2))
+            for middle in step.middles or nodes[:1]:
+                self._ring(middle, colors.error if failed else marks["swap"], min(1.0, p * 2))
             if not failed and p >= 0.5:
                 for pair in step.produced:
                     self._draw_pair(pair, marks["pair"], width=2 + 3 * min(1.0, (p - 0.5) * 3))
         elif kind in ("purify", "purify_fail") and nodes:
+            failed = kind == "purify_fail"
+            groups: dict[str, list[Pair]] = {}
             for pair in step.consumed:
-                self._draw_pair(pair, colors.error if kind == "purify_fail" else marks["swap"], label=False)
-            for node in nodes:
-                self._ring(node, marks["swap"], p, width=3)
-            if kind == "purify" and p >= 0.5:
+                groups.setdefault(link_name(pair.a, pair.b), []).append(pair)
+            if p < 0.55 or failed:
+                # The pairs that go in sit side by side, then close together into one.
+                apart = 1.0 if failed else min(1.0, max(0.0, (0.55 - p) / 0.35))
+                for group in groups.values():
+                    for index, pair in enumerate(group):
+                        label = f"{len(group)} pairs at {pair.fidelity:.3f}" if index == 0 and len(group) > 1 else False
+                        self._draw_pair(pair, colors.error if failed and p > 0.3 else marks["pair"], label=label,
+                                        shift=(index - (len(group) - 1) / 2) * 14 * apart)
+            for node in dict.fromkeys(nodes):
+                self._ring(node, colors.error if failed else marks["swap"], p, width=3)
+            if not failed and p >= 0.5:
                 for pair in step.produced:
-                    self._draw_pair(pair, marks["pair"])
+                    self._draw_pair(pair, marks["pair"], width=2 + 3 * min(1.0, (p - 0.5) * 3))
         elif kind == "deliver":
             for pair in step.consumed:
                 self._draw_pair(pair, marks["delivered"], width=6, dashed=False)
@@ -602,9 +872,79 @@ class PathReplay:
                 self._ring(node, colors.accent, p, width=2)
         elif kind == "reject" and nodes:
             self._ring(nodes[0], colors.error, p)
-        if kind not in ("swap", "swap_fail", "purify", "purify_fail", "link_pair", "deliver"):
+        if kind not in ("swap", "swap_fail", "purify", "purify_fail", "link_pair", "links", "deliver"):
             for pair in step.produced:
                 self._draw_pair(pair, marks["pair"])
+
+    def _draw_herald(self, a: str, b: str, p: float, pair: Pair | None) -> None:
+        """Photons from both ends meet at the middle station: a red cross if lost, a new pair if heralded."""
+        c, marks, colors = self.canvas, self.marks, self.colors
+        travel = min(1.0, p / 0.5)
+        for end in (a, b):
+            if p < 0.55:
+                x, y = self._point(end, b if end == a else a, 0.5 * travel)
+                c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=marks["pair"], outline="")
+        mx, my = self._point(a, b, 0.5)
+        if pair is None and p >= 0.5:
+            c.create_line(mx - 8, my - 8, mx + 8, my + 8, fill=colors.error, width=3)
+            c.create_line(mx - 8, my + 8, mx + 8, my - 8, fill=colors.error, width=3)
+        elif pair is not None and p >= 0.5:
+            grow = min(1.0, (p - 0.5) / 0.35)
+            (x1, y1), (x2, y2) = self._point(a, b, 0.5 - grow / 2), self._point(a, b, 0.5 + grow / 2)
+            c.create_line(x1, y1, x2, y2, fill=marks["pair"], width=4)
+            if grow >= 1.0:
+                self._draw_pair(pair, marks["pair"])
+            if p < 0.7:
+                c.create_oval(mx - 10, my - 10, mx + 10, my + 10, outline=marks["pair"], width=3)
+
+    def _draw_meter(self, step: Step, p: float, top: float) -> None:
+        """A bar from too noisy up to good enough to use, with the newest pair's fidelity moving along it."""
+        c, colors = self.canvas, self.colors
+        target = self._trial(step).get("target_fidelity")
+        value = step.fidelity if step.fidelity is not None else (step.levels[-1] if step.levels else None)
+        if value is not None and step.fidelity is not None and step.levels and step.kind != "links":
+            # Slide from the last level to the new one in the middle of the step.
+            start = step.levels[-1]
+            ease = min(1.0, max(0.0, (p - 0.3) / 0.4))
+            value = start + (value - start) * (3 * ease ** 2 - 2 * ease ** 3)
+        known = [f for f in (*step.levels, value) if f is not None]
+        lowest = min(known + ([target - 0.15] if target is not None else [0.6]))
+        low, high = math.floor((lowest - 0.03) * 20) / 20, 1.0
+        title = c.create_text(20, top, anchor="nw", text="Fidelity of the\nnewest pair", fill=colors.text,
+                              font=self.fonts["small"], justify="left")
+        y0, y1 = c.bbox(title)[3] + 18, c.winfo_height() - 46
+        if y1 - y0 < 80:
+            return
+        x0, x1 = 66, 84
+
+        def y(f: float) -> float:
+            return y1 - (min(max(f, low), high) - low) / (high - low) * (y1 - y0)
+
+        if target is not None:
+            c.create_rectangle(x0, y(target), x1, y1, fill=_blend(colors.error, colors.canvas, 0.8), outline="")
+            c.create_rectangle(x0, y0, x1, y(target), fill=_blend(self.good, colors.canvas, 0.8), outline="")
+        c.create_rectangle(x0, y0, x1, y1, outline=colors.border)
+        if y1 - y0 >= 170:
+            for f in (low, high):
+                c.create_text(x1 + 8, y(f), anchor="w", text=f"{f:g}", fill=colors.muted, font=self.fonts["small"])
+        if target is not None:
+            c.create_line(x0 - 5, y(target), x1 + 5, y(target), fill=colors.text, width=2)
+            c.create_text(x1 + 8, y(target), anchor="w", text=f"{target:g} target", fill=colors.text,
+                          font=self.fonts["small"])
+            c.create_text(x1 + 8, (y0 + y(target)) / 2, anchor="w", text="good enough", fill=self.good,
+                          font=self.fonts["small"])
+            c.create_text(x1 + 8, (y(target) + y1) / 2, anchor="w", text="too noisy", fill=colors.error,
+                          font=self.fonts["small"])
+        middle = (x0 + x1) / 2
+        for f in step.levels:
+            c.create_oval(middle - 4, y(f) - 4, middle + 4, y(f) + 4, fill=colors.canvas, outline=colors.muted,
+                          width=2)
+        if value is not None:
+            fill = self.good if target is not None and value >= target else self.marks["pair"]
+            c.create_oval(middle - 8, y(value) - 8, middle + 8, y(value) + 8, fill=fill, outline=colors.canvas,
+                          width=2)
+            c.create_text(x0 - 8, y(value), anchor="e", text=f"{value:.3f}", fill=colors.text,
+                          font=self.fonts["small"])
 
     def _draw_header(self, step: Step | None) -> float:
         """Trial name, clock, counter, and the caption for this step. Returns the bottom of the text."""
@@ -631,11 +971,13 @@ class PathReplay:
                                 fill=colors.text, font=self.fonts["heading"])
         tried, failed, swap_failed = self._failures(step)
         rate = f" ({100 * failed / tried:.0f}%)" if tried else ""
+        text = f"Link attempts failed: {failed:,} of {tried:,}{rate}\nSwaps failed: {swap_failed:,}"
+        if step.tally is not None:
+            text += f"\nPurifications failed: {step.tally.purify_failed:,} of {step.tally.purified:,}"
         fails = c.create_text(right, c.bbox(counter)[3] + 4, anchor="ne", fill=colors.text, font=self.fonts["small"],
-                              text=f"Link attempts failed: {failed} of {tried}{rate}\nSwaps failed: {swap_failed}",
-                              justify="right")
+                              text=text, justify="right")
         bottom = c.bbox(fails)[3]
-        if step.kind != "title":
+        if step.kind not in ("title", "cost"):
             item = c.create_text(side, 46, anchor="nw", width=max(240, width - 2 * side - 290), text=step.caption,
                                  fill=colors.text, font=self.fonts["caption"])
             bottom = max(bottom, c.bbox(item)[3])
@@ -643,6 +985,8 @@ class PathReplay:
 
     def _failures(self, step: Step) -> tuple[int, int, int]:
         """Link attempts so far, how many failed, and failed swaps, for this trial up to this step."""
+        if step.tally is not None:
+            return step.tally.tried, step.tally.failed, step.tally.swaps_failed
         tried = failed = swap_failed = 0
         for earlier in self.steps[:self.index + 1]:
             if earlier.trial != step.trial:
@@ -652,9 +996,10 @@ class PathReplay:
             swap_failed += earlier.kind == "swap_fail"
         return tried, failed, swap_failed
 
-    def _draw_legend(self, top: float, panel: int) -> None:
+    def _draw_legend(self, top: float, panel: int, step: Step | None = None) -> None:
         """Key down the right side, with the one line explanation under it."""
         c, colors, marks = self.canvas, self.colors, self.marks
+        purifying = step is not None and step.levels is not None
         x = c.winfo_width() - panel
         items = [
             ("line", marks["pair"], "Bell pair, one qubit\nkept at each end"),
@@ -665,6 +1010,8 @@ class PathReplay:
             ("box", marks["packet"], "REQUEST or APPROVE\nmessage booking memory"),
             ("dot", colors.muted, "Middle station (BSM)"),
         ]
+        if purifying:
+            items.insert(3, ("ring", marks["swap"], "Swap or purify at\nthis router"))
         y = top + 4
         for shape, colour, text in items:
             if shape in ("line", "dash"):
@@ -677,12 +1024,14 @@ class PathReplay:
                 c.create_line(x + 6, y + 14, x + 18, y + 2, fill=colour, width=3)
             elif shape == "box":
                 c.create_rectangle(x + 6, y + 2, x + 18, y + 14, fill=colour, outline="")
+            elif shape == "ring":
+                c.create_oval(x + 4, y, x + 20, y + 16, outline=colour, width=3)
             else:
                 c.create_rectangle(x + 9, y + 5, x + 15, y + 11, fill=colour, outline="")
             item = c.create_text(x + 34, y, anchor="nw", text=text, fill=colors.text, font=self.fonts["small"])
             y = c.bbox(item)[3] + 10
         explainer = c.create_text(x, y + 6, anchor="nw", width=panel - 24, fill=colors.muted,
-                                  font=self.fonts["small"], text=EXPLAINER)
+                                  font=self.fonts["small"], text=PURIFY_EXPLAINER if purifying else EXPLAINER)
         if c.bbox(explainer)[3] > c.winfo_height() - 30:
             c.delete(explainer)  # The title card says it too, so drop it when space is short.
 
@@ -698,7 +1047,9 @@ class PathReplay:
     def _draw_card(self, step: Step) -> None:
         c, colors = self.canvas, self.colors
         left, top, right, bottom = self.canvas.bounds
-        card_width = min(600, right - left + 20)
+        if step.levels is not None:
+            left = 20  # The meter sits left of the network. Cover it too, for a wider card.
+        card_width = min(640, right - left + 20)
         title = step.title
         body = step.caption
         cx, cy = (left + right) / 2, (top + bottom) / 2
