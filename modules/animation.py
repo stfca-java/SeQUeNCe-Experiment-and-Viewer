@@ -9,7 +9,9 @@ memory on the path Dijkstra picked.
 
 A trial that purifies makes thousands of events, far too many to replay one by one.
 Its replay goes one fidelity level at a time instead: link pairs, each swap, and each
-purify round, with a meter that shows the fidelity climbing to the target.
+purify round. A row of fidelity boxes under the caption shows each swap knocking the
+fidelity down and each purify round (2 pairs in, 1 better pair out) building it back
+up until it reaches the target.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ PURIFY_EXPLAINER = ("Purifying uses up one Bell pair to raise the fidelity of an
                     "better pair comes out. SeQUeNCe repeats it until the pair reaches the target.")
 SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0, "4x": 4.0}
 FRAME_MS = 33
-METER_WIDTH = 160  # Space left of the network for the fidelity meter.
 
 # Seconds each kind of step stays on screen at 1x.
 DURATION = {
@@ -86,8 +87,10 @@ class Step:
     title: str = ""
     middles: tuple[str, ...] = ()            # routers that swap in this step
     tally: Tally | None = None               # counts so far, when the steps are grouped
-    levels: tuple[float, ...] | None = None  # fidelity levels reached so far; None hides the meter
+    levels: tuple[float, ...] | None = None  # fidelity levels reached so far, in a trial that purifies
     seconds: float | None = None             # how long to show it at 1x, if not the usual time
+    chain: tuple[tuple[float, str, str], ...] | None = None  # fidelity boxes: (value, how it was made, tag)
+    chain_at: int = 0                        # the box this step makes
 
     @property
     def duration(self) -> float:
@@ -360,6 +363,7 @@ class _TrialSteps:
                     stage["members"].append(member)
 
         ordered = list(stages.values())
+        self._chains(ordered)
         for stage in ordered:
             self.tally = stage["tally"]
             if stage["kind"] == "links":
@@ -374,6 +378,38 @@ class _TrialSteps:
             self._story_deliver(event, first=number == 0)
         self.tally = counts
         self._story_end(end)
+
+    def _chains(self, ordered: list[dict[str, Any]]) -> None:
+        """Split the levels into rows of boxes: each row starts at a swap and runs through its purify rounds.
+
+        A row reads like: link pairs 0.85, swap, 0.686, purify, 0.720, ... until it is good enough again.
+        """
+        rows: list[list[tuple[float, str, str]]] = []
+        self._box: dict[int, tuple[int, int]] = {}  # stage -> (row, box)
+        start: float | None = None
+        for stage in ordered:
+            fidelity = stage["fidelity"]
+            if stage["kind"] == "links":
+                start = fidelity
+                self._box[id(stage)] = (len(rows), 0)  # The first box of the next row.
+                continue
+            first = "link pairs" if not rows else "before swap"
+            if stage["kind"] == "swap":
+                before = rows[-1][-1][0] if rows else start
+                rows.append(([(before, "start", first)] if before is not None else []) + [(fidelity, "swap", "after swap")])
+            elif not rows:
+                rows.append([(start, "start", first)] if start is not None else [])
+                rows[-1].append((fidelity, "purify", ""))
+            else:
+                rows[-1].append((fidelity, "purify", ""))
+            self._box[id(stage)] = (len(rows) - 1, len(rows[-1]) - 1)
+        self._rows = [tuple(row) for row in rows]
+
+    def _chain(self, stage: dict[str, Any]) -> dict[str, Any]:
+        row, box = self._box.get(id(stage), (0, 0))
+        if row >= len(self._rows):
+            return {}
+        return {"chain": self._rows[row], "chain_at": box}
 
     @staticmethod
     def _links(stage: dict[str, Any]) -> frozenset[str]:
@@ -401,7 +437,7 @@ class _TrialSteps:
                    + self._status(fidelity, "they purify first", "they can be swapped straight away")
                    + f" Each router keeps up to {_plural(memories, 'pair')}, so it has spares to purify with.")
         self.add("links", caption, t=stage["t"], nodes=tuple(n for m in members for n in m), fidelity=fidelity,
-                 produced=pairs)
+                 produced=pairs, **self._chain(stage))
         self.levels.append(fidelity)
 
     def _story_swap(self, stage: dict[str, Any]) -> None:
@@ -418,7 +454,8 @@ class _TrialSteps:
                    f"but swapping lowers fidelity to {fidelity:.3f}."
                    + self._status(fidelity, "they purify", "they can be swapped again or used"))
         self.add("swap", caption, t=stage["t"], nodes=tuple(middles), middles=tuple(middles),
-                 fidelity=fidelity, consumed=tuple(consumed), produced=tuple(produced), seconds=3.4)
+                 fidelity=fidelity, consumed=tuple(consumed), produced=tuple(produced), seconds=3.6,
+                 **self._chain(stage))
         self.levels.append(fidelity)
 
     def _story_purify(self, stage: dict[str, Any], round_: int, rounds: int) -> None:
@@ -431,18 +468,19 @@ class _TrialSteps:
                 consumed.extend((old, old))  # Drawn as the two pairs that go in.
             produced.append(Pair(a, b, fidelity, cost=2 * old.cost if old else 2))
         spans = _and([self._span(a, b) for a, b in stage["members"]])
-        made = (f"two pairs at {before:.3f} become one pair at {fidelity:.3f}" if before is not None
-                else f"two pairs become one pair at {fidelity:.3f}")
+        made = (f"2 pairs at {before:.3f} go in, 1 better pair at {fidelity:.3f} comes out" if before is not None
+                else f"2 pairs go in, 1 better pair at {fidelity:.3f} comes out")
         caption = f"Purify round {round_} of {rounds} on {spans}: {made}."
         if round_ == 1:
-            caption += " If the check fails, both pairs are thrown away."
+            caption += " If the check fails, both pairs are thrown away and they try again."
         if self.target is not None and fidelity < self.target:
             caption += f" Still under {_fmt(self.target)}, so they purify again."
         elif self.target is not None:
             caption += (f" That is {_fmt(self.target)} or more, so purifying stops. {rounds} round"
                         f"{'s' if rounds != 1 else ''} turned {2 ** rounds} pairs into 1.")
         self.add("purify", caption, t=stage["t"], nodes=tuple(n for m in stage["members"] for n in m),
-                 fidelity=fidelity, consumed=tuple(consumed), produced=tuple(produced), seconds=3.6)
+                 fidelity=fidelity, consumed=tuple(consumed), produced=tuple(produced), seconds=4.0,
+                 **self._chain(stage))
         self.levels.append(fidelity)
 
     def _story_deliver(self, event: dict[str, Any], *, first: bool) -> None:
@@ -456,8 +494,9 @@ class _TrialSteps:
         else:
             caption = (f"More rounds bring another pair to {_fmt(self.target)} or more. Delivered with fidelity "
                        f"{fidelity:.3f}. Count: {self.delivered}.")
+        last = {"chain": self._rows[-1], "chain_at": len(self._rows[-1]) - 1} if first and self._rows else {}
         self.add("deliver", caption, t=t, nodes=(self.source, self.destination), fidelity=fidelity,
-                 consumed=(pair,))
+                 consumed=(pair,), **last)
         if not self.levels or self.levels[-1] != fidelity:
             self.levels.append(fidelity)
         if first:
@@ -492,7 +531,8 @@ class _TrialSteps:
                         f"{made:,} link pairs.")
         elif self.target is not None:
             caption += f" No pair reached {_fmt(self.target)} before the window closed."
-        self.add("end", caption, t=end, title=f"{_plural(delivered, 'Bell pair')} delivered")
+        last = {"chain": self._rows[-1], "chain_at": len(self._rows[-1]) - 1} if self._rows else {}
+        self.add("end", caption, t=end, title=f"{_plural(delivered, 'Bell pair')} delivered", **last)
 
 
 def build_steps(run: dict[str, Any], choice: int | None = None) -> list[Step]:
@@ -694,8 +734,9 @@ class PathReplay:
         legend = self.canvas.legend_width()
         if legend:
             self._draw_legend(top, legend, step)
-        meter = step is not None and step.levels is not None
-        self.canvas.place_network(top, 40, legend, left=METER_WIDTH if meter else 0)
+        story = step is not None and step.levels is not None
+        # A trial that purifies keeps room under the network for its row of fidelity boxes.
+        self.canvas.place_network(top, (106 if compact else 130) if story else 40, legend)
         route = step.route if step else ()
         if step and step.kind == "request":
             route = ()
@@ -711,8 +752,8 @@ class PathReplay:
         trial = self._trial(step)
         ends = {trial.get("source"): "source", trial.get("destination"): "destination"} if trial else {}
         self.canvas.draw_nodes(route, ends)
-        if meter:
-            self._draw_meter(step, progress, top)
+        if story and step.chain and step.kind not in ("title", "cost"):
+            self._draw_chain(step, progress, legend)
         self._draw_footer()
         if step and step.kind in ("title", "cost"):
             self._draw_card(step)
@@ -760,8 +801,11 @@ class PathReplay:
             nx, ny = -(y2 - y1) / length * shift, (x2 - x1) / length * shift
             points = [value + (nx if index % 2 == 0 else ny) for index, value in enumerate(points)]
             apex = (apex[0] + nx, apex[1] + ny)
-        target = self._trial(self.steps[self.index] if self.steps else None).get("target_fidelity")
+        current = self.steps[self.index] if self.steps else None
+        target = self._trial(current).get("target_fidelity")
         low = target is not None and pair.fidelity < target
+        if label is True and current is not None and current.chain:
+            label = False  # The row of fidelity boxes shows the numbers.
         dash = (8, 6) if (low if dashed is None else dashed) else ()
         c.create_line(*points, fill=colour, width=width, smooth=len(points) > 4, dash=dash, capstyle="round")
         for end, toward in ((points[:2], points[2:4]), (points[-2:], points[-4:-2])):
@@ -848,7 +892,7 @@ class PathReplay:
                 apart = 1.0 if failed else min(1.0, max(0.0, (0.55 - p) / 0.35))
                 for group in groups.values():
                     for index, pair in enumerate(group):
-                        label = f"{len(group)} pairs at {pair.fidelity:.3f}" if index == 0 and len(group) > 1 else False
+                        label = f"{len(group)} pairs" if index == 0 and len(group) > 1 else False
                         self._draw_pair(pair, colors.error if failed and p > 0.3 else marks["pair"], label=label,
                                         shift=(index - (len(group) - 1) / 2) * 14 * apart)
             for node in dict.fromkeys(nodes):
@@ -897,54 +941,87 @@ class PathReplay:
             if p < 0.7:
                 c.create_oval(mx - 10, my - 10, mx + 10, my + 10, outline=marks["pair"], width=3)
 
-    def _draw_meter(self, step: Step, p: float, top: float) -> None:
-        """A bar from too noisy up to good enough to use, with the newest pair's fidelity moving along it."""
-        c, colors = self.canvas, self.colors
+    def _draw_chain(self, step: Step, p: float, legend: int) -> None:
+        """Fidelity boxes joined by swap and purify arrows, under the network.
+
+        Boxes up to this step are filled (red tint = too noisy, green tint = good enough). The arrow into
+        this step's box grows, then the box appears. Later boxes are dashed, to show how many rounds are left.
+        """
+        c, colors, marks = self.canvas, self.colors, self.marks
+        chain, at = list(step.chain), step.chain_at
         target = self._trial(step).get("target_fidelity")
-        value = step.fidelity if step.fidelity is not None else (step.levels[-1] if step.levels else None)
-        if value is not None and step.fidelity is not None and step.levels and step.kind != "links":
-            # Slide from the last level to the new one in the middle of the step.
-            start = step.levels[-1]
-            ease = min(1.0, max(0.0, (p - 0.3) / 0.4))
-            value = start + (value - start) * (3 * ease ** 2 - 2 * ease ** 3)
-        known = [f for f in (*step.levels, value) if f is not None]
-        lowest = min(known + ([target - 0.15] if target is not None else [0.6]))
-        low, high = math.floor((lowest - 0.03) * 20) / 20, 1.0
-        title = c.create_text(20, top, anchor="nw", text="Fidelity of the\nnewest pair", fill=colors.text,
-                              font=self.fonts["small"], justify="left")
-        y0, y1 = c.bbox(title)[3] + 18, c.winfo_height() - 46
-        if y1 - y0 < 80:
-            return
-        x0, x1 = 66, 84
-
-        def y(f: float) -> float:
-            return y1 - (min(max(f, low), high) - low) / (high - low) * (y1 - y0)
-
-        if target is not None:
-            c.create_rectangle(x0, y(target), x1, y1, fill=_blend(colors.error, colors.canvas, 0.8), outline="")
-            c.create_rectangle(x0, y0, x1, y(target), fill=_blend(self.good, colors.canvas, 0.8), outline="")
-        c.create_rectangle(x0, y0, x1, y1, outline=colors.border)
-        if y1 - y0 >= 170:
-            for f in (low, high):
-                c.create_text(x1 + 8, y(f), anchor="w", text=f"{f:g}", fill=colors.muted, font=self.fonts["small"])
-        if target is not None:
-            c.create_line(x0 - 5, y(target), x1 + 5, y(target), fill=colors.text, width=2)
-            c.create_text(x1 + 8, y(target), anchor="w", text=f"{target:g} target", fill=colors.text,
-                          font=self.fonts["small"])
-            c.create_text(x1 + 8, (y0 + y(target)) / 2, anchor="w", text="good enough", fill=self.good,
-                          font=self.fonts["small"])
-            c.create_text(x1 + 8, (y(target) + y1) / 2, anchor="w", text="too noisy", fill=colors.error,
-                          font=self.fonts["small"])
-        middle = (x0 + x1) / 2
-        for f in step.levels:
-            c.create_oval(middle - 4, y(f) - 4, middle + 4, y(f) + 4, fill=colors.canvas, outline=colors.muted,
-                          width=2)
-        if value is not None:
-            fill = self.good if target is not None and value >= target else self.marks["pair"]
-            c.create_oval(middle - 8, y(value) - 8, middle + 8, y(value) + 8, fill=fill, outline=colors.canvas,
-                          width=2)
-            c.create_text(x0 - 8, y(value), anchor="e", text=f"{value:.3f}", fill=colors.text,
-                          font=self.fonts["small"])
+        width, height = c.winfo_width(), c.winfo_height()
+        left, right = 24, width - legend - 24
+        gap = 50
+        shown = 0
+        # Drop boxes from the start if the row does not fit, keeping this step's box in view.
+        while len(chain) - shown > 2:
+            box = (right - left - (len(chain) - shown - 1) * gap) / (len(chain) - shown)
+            if box >= 56 or shown >= at:
+                break
+            shown += 1
+        boxes = chain[shown:]
+        box = min(88, (right - left - (len(boxes) - 1) * gap) / len(boxes))
+        total = len(boxes) * box + (len(boxes) - 1) * gap
+        x = left + max(0, (right - left - total) / 2)
+        compact = height < 460
+        top = height - (70 if compact else 88)
+        bottom = top + (24 if compact else 30)
+        middle = (top + bottom) / 2
+        appear = 0.55 if step.kind in ("swap", "purify") else 0.0
+        delivered = step.kind in ("deliver", "end") and step.delivered > 0
+        number = self.fonts["small"] if compact else self.fonts["caption"]
+        if shown:
+            c.create_text(x - 6, middle, anchor="e", text="…", fill=colors.muted, font=self.fonts["caption"])
+        for index, (value, how, tag) in enumerate(boxes, start=shown):
+            x0, x1 = x + (index - shown) * (box + gap), x + (index - shown) * (box + gap) + box
+            if index > shown:
+                # The arrow from the box before, with what made this box.
+                a0, a1 = x0 - gap + 4, x0 - 4
+                done = index < at or (index == at and p >= appear)
+                if index == at and not done:
+                    grow = min(1.0, max(0.0, (p - 0.15) / (appear - 0.15)))
+                    c.create_line(a0, middle + 6, a1, middle + 6, fill=colors.border, width=2, dash=(4, 3))
+                    if grow > 0:
+                        c.create_line(a0, middle + 6, a0 + (a1 - a0) * grow, middle + 6,
+                                      fill=marks["swap"] if how == "swap" else marks["pair"], width=3,
+                                      arrow="last" if grow >= 1 else None)
+                elif index <= at:
+                    c.create_line(a0, middle + 6, a1, middle + 6, fill=colors.muted, width=2, arrow="last")
+                else:
+                    c.create_line(a0, middle + 6, a1, middle + 6, fill=colors.border, width=2, dash=(4, 3),
+                                  arrow="last")
+                ink = (marks["swap"] if how == "swap" else marks["pair"]) if index == at else (
+                    colors.muted if index < at else colors.border)
+                c.create_text((a0 + a1) / 2, middle - 7, text=how, fill=ink, font=self.fonts["small"])
+            reached = index < at or (index == at and p >= appear)
+            good = target is not None and value >= target
+            fill = _blend(self.good if good else colors.error, colors.canvas, 0.8)
+            if step.kind == "purify" and index == at - 1:
+                # Two pairs go in: draw this box as a stack of two.
+                c.create_rectangle(x0 + 5, top - 5, x1 + 5, bottom - 5, fill=fill, outline=colors.text, width=1.5)
+            if delivered and index == len(chain) - 1:
+                c.create_rectangle(x0, top, x1, bottom, fill=self.good, outline=self.good, width=2)
+                c.create_text((x0 + x1) / 2, middle, text=f"{value:.3f}", fill="#FFFFFF", font=number)
+                tag, tint = "delivered", self.good
+            elif reached:
+                c.create_rectangle(x0, top, x1, bottom, fill=fill, outline=colors.accent if index == at else colors.text,
+                                   width=3 if index == at else 1.5)
+                c.create_text((x0 + x1) / 2, middle, text=f"{value:.3f}", fill=colors.text, font=number)
+                tint = colors.muted
+                if good and how == "purify":
+                    tag, tint = ("good enough", self.good)
+            else:
+                c.create_rectangle(x0, top, x1, bottom, outline=colors.border, width=1.5, dash=(4, 3))
+                c.create_text((x0 + x1) / 2, middle, text=f"{value:.3f}", fill=colors.border, font=number)
+                tag = ""
+                tint = colors.muted
+            if step.kind == "purify" and index == at - 1:
+                tag, tint = "2 pairs in", colors.text
+            elif step.kind == "purify" and index == at and reached:
+                tag, tint = "1 better pair out", colors.text
+            if tag:
+                c.create_text((x0 + x1) / 2, bottom + 4, anchor="n", text=tag, fill=tint, font=self.fonts["small"])
 
     def _draw_header(self, step: Step | None) -> float:
         """Trial name, clock, counter, and the caption for this step. Returns the bottom of the text."""
@@ -1047,8 +1124,6 @@ class PathReplay:
     def _draw_card(self, step: Step) -> None:
         c, colors = self.canvas, self.colors
         left, top, right, bottom = self.canvas.bounds
-        if step.levels is not None:
-            left = 20  # The meter sits left of the network. Cover it too, for a wider card.
         card_width = min(640, right - left + 20)
         title = step.title
         body = step.caption

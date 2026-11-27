@@ -95,12 +95,12 @@ class TopologyCanvas(tk.Canvas):
         if event is not None and self.fit.get():
             self.center_preview()
 
-    def place_network(self, top: float, bottom: float, right: float = 0, left: float = 0) -> None:
+    def place_network(self, top: float, bottom: float, right: float = 0) -> None:
         width, height = self.winfo_width(), self.winfo_height()
         side = 56
         xs, ys = zip(*self.positions.values())
         span_x, span_y = max(max(xs) - min(xs), 1), max(max(ys) - min(ys), 1)
-        room_x, room_y = max(width - 2 * side - right - left, 50), max(height - top - bottom, 50)
+        room_x, room_y = max(width - 2 * side - right, 50), max(height - top - bottom, 50)
         # Use the replay viewport to pick the same orientation even before captions appear.
         ref_x = max(width - 2 * side - self.legend_width(), 50)
         ref_y = max(self.master.winfo_height() - 170, 50)
@@ -109,7 +109,7 @@ class TopologyCanvas(tk.Canvas):
             span_x, span_y = span_y, span_x
         scale = min(room_x / span_x, room_y / span_y, 2.2) if self.fit.get() else 2.2
         cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
-        mid_x, mid_y = left + side + room_x / 2, top + room_y / 2
+        mid_x, mid_y = side + room_x / 2, top + room_y / 2
         self.screen = {}
         for name, (x, y) in self.positions.items():
             dx, dy = x - cx, y - cy
@@ -117,7 +117,7 @@ class TopologyCanvas(tk.Canvas):
                 dx, dy = -dy, dx
             self.screen[name] = (mid_x + dx * scale, mid_y + dy * scale)
         self.centre = (mid_x, mid_y)
-        self.bounds = (left + side - 30, top - 6, left + side + room_x + 30, top + room_y + 16)
+        self.bounds = (side - 30, top - 6, side + room_x + 30, top + room_y + 16)
         # Keep the viewport centred at its normal origin, including when the graph overflows.
         margin_x = max(width / 2, (span_x * scale - room_x) / 2 + side)
         margin_y = max(height / 2, (span_y * scale - room_y) / 2 + bottom)

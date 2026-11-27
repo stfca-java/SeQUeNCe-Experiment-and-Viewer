@@ -24,7 +24,7 @@ Each run is saved to `results/` as one JSON file: the settings, the path Dijkstr
 
 After **Run test** finishes, the viewer replays the run slowly in place of the picture: REQUEST and APPROVE messages booking memory on the Dijkstra path, link attempts at each middle station (failed ones marked), Bell pairs on each link, swaps joining them, and pairs delivered end to end. Bell pairs are made link by link and swaps join them into one end to end pair, so no qubit travels the whole route. Click the picture to pause, or use **Replay**, **Show** and **Speed** above it.
 
-A trial that purifies makes thousands of events, so its replay goes one fidelity level at a time: link pairs, each swap, then each purify round, with a meter on the left showing the newest pair's fidelity dropping at each swap and climbing back to the 0.8 target. A card then shows what the first usable pair cost.
+A trial that purifies makes thousands of events, so its replay goes one fidelity level at a time: link pairs, each swap, then each purify round, with a row of fidelity boxes under the network: each swap knocks the fidelity down, and each purify round (2 pairs in, 1 better pair out) builds it back up until the box turns green at 0.8. A card then shows what the first usable pair cost.
 
 ## Stats
 
