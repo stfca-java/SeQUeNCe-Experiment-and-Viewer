@@ -1,7 +1,8 @@
 """Network statistics: chart and compare the results files that Run test saves.
 
 For each trial it shows the path Dijkstra picked, the Bell pairs delivered, how
-many link attempts and swaps failed, and the fidelity of the qubits along the way.
+many link attempts, swaps and purifications failed, and the fidelity of the qubits
+along the way.
 Each chart says in plain words what it shows, for people new to quantum networks.
 
 Open it from the Show stats button, or on its own:
@@ -36,7 +37,9 @@ GLOSSARY = (
     "Words used:   Bell pair = two entangled (linked) qubits, one kept at each end.   "
     "Link attempt = one try at making a Bell pair across a single fibre link.\n"
     "Swap = a router in the middle joins two Bell pairs into one longer pair.   "
-    "Fidelity = how close a pair is to perfect, from 0 to 1 (1 is perfect)."
+    "Fidelity = how close a pair is to perfect, from 0 to 1 (1 is perfect).\n"
+    "Purify = use up one Bell pair to raise the fidelity of another (two pairs in, one better pair out), "
+    "repeated until the pair reaches the target."
 )
 
 # Categorical colours from the reference data palette (fixed order, light and dark steps).
@@ -115,27 +118,46 @@ def _swap_keeps(trial: dict[str, Any]) -> float:
     return DEFAULT_SWAP if swap is None else swap
 
 
-def _hardware(trial: dict[str, Any]) -> str:
+def _purifies(trial: dict[str, Any]) -> bool:
+    return bool(trial.get("purify") or (trial.get("purifications") or {}).get("success"))
+
+
+def _link_pairs(trial: dict[str, Any]) -> int:
+    return sum(v.get("successes", 0) for v in (trial.get("link_attempts") or {}).values())
+
+
+def _hardware(trial: dict[str, Any], first: dict[str, Any]) -> str:
     if trial.get("memory_fidelity") is None:
         return ""
     default = " (SeQUeNCe default)" if trial.get("swap_degradation") is None else ""
-    return (f"{trial['label']}: new link pairs have fidelity {trial['memory_fidelity']:g} and each swap keeps "
+    text = (f"{trial['label']}: new link pairs have fidelity {trial['memory_fidelity']:g} and each swap keeps "
             f"{100 * _swap_keeps(trial):g}% of the quality{default}.")
+    if (trial.get("memories"), trial.get("start_s"), trial.get("end_s")) != (
+            first.get("memories"), first.get("start_s"), first.get("end_s")):
+        memories = trial.get("memories", 1)
+        text += (f" It has {memories} {'memory' if memories == 1 else 'memories'} per router and asks from "
+                 f"{trial['start_s']:g} s to {trial['end_s']:g} s.")
+    if _purifies(trial):
+        text += (f" Any pair under {trial['target_fidelity']:g} is purified, again and again, until it reaches "
+                 f"{trial['target_fidelity']:g}.")
+    return text
 
 
 def describe(run: dict[str, Any]) -> str:
     """Plain words summary of the request, the path and what differs between trials."""
     trials = run["trials"]
     first = trials[0]
+    memories = first.get("memories", 1)
     lines = [f"What this shows: {first['source']} asks the network for Bell pairs with {first['destination']} "
-             f"from {first['start_s']:g} s to {first['end_s']:g} s. A pair only counts if its fidelity is at "
-             f"least {first['target_fidelity']:g}."]
+             f"from {first['start_s']:g} s to {first['end_s']:g} s, with {memories} "
+             f"{'memory' if memories == 1 else 'memories'} per router unless a trial says otherwise. "
+             f"A pair only counts if its fidelity is at least {first['target_fidelity']:g}."]
     route = _route(trials)
     if route:
         km = next((t.get("path_km") for t in trials if t.get("path_km")), None)
         lines.append(f"Dijkstra picks the shortest path, {' → '.join(route)}" + (f" ({km:g} km)" if km else "")
-                     + f". The same request runs {len(trials)} times with different hardware values.")
-    lines.extend(filter(None, (_hardware(t) for t in trials)))
+                     + f". The same request runs {len(trials)} times with different settings.")
+    lines.extend(filter(None, (_hardware(t, first) for t in trials)))
     return "\n".join(lines)
 
 
@@ -164,6 +186,8 @@ def _chart_delivered(ax, run: dict[str, Any], colors: Palette, colour: dict[str,
         note = _pairs(trial["delivered"])
         if trial["delivered"] == 0 and _too_noisy(trial):
             note += ": pairs were built, but too noisy to use (see chart 4)"
+        elif trial["delivered"] and _purifies(trial):
+            note += f" after purifying, from {_link_pairs(trial):,} link pairs"
         ax.annotate(note, (bar.get_width(), bar.get_y() + bar.get_height() / 2), xytext=(6, 0),
                     textcoords="offset points", va="center", fontsize=9, color=colors.text)
     ax.set_xlim(0, max(values + [1]) * 1.4)
@@ -177,17 +201,20 @@ def _chart_timeline(ax, run: dict[str, Any], colors: Palette, colour: dict[str, 
     """Chart 2: Bell pairs delivered over time since the window opened."""
     trials, source, destination, window = _basics(run)
     ax = _panel(ax, colors, "2. When each Bell pair arrived",
-                f"Each step up is one more Bell pair delivered to {source} and {destination} "
-                f"during the {window:g} second request window.")
+                f"Each step up is one more Bell pair delivered to {source} and {destination}. "
+                "Each line stops when that trial's request window closes.")
     counts = []
     for trial in trials:
         times = [e["t"] - trial["start_s"] for e in _deliveries(trial)]
         counts.append(len(times))
-        xs = [0.0] + times + [window]
+        own = trial["end_s"] - trial["start_s"]  # Trials can ask for different windows.
+        xs = [0.0] + times + [own]
         ys = list(range(len(times) + 1)) + [len(times)]
         ax.step(xs, ys, where="post", color=colour[trial["label"]], linewidth=2)
-        ax.annotate(f"{trial['label']}: {_pairs(len(times))}", (window, len(times)), xytext=(-4, 5),
-                    textcoords="offset points", ha="right", va="bottom", fontsize=9, color=colors.text)
+        last = own >= window * 0.75
+        ax.annotate(f"{trial['label']}: {_pairs(len(times))}", (own, len(times)), xytext=(-4 if last else 4, 5),
+                    textcoords="offset points", ha="right" if last else "left", va="bottom", fontsize=9,
+                    color=colors.text)
     ax.set_xlim(0, window)
     ax.set_ylim(0, max(counts + [1]) + 1)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
@@ -212,13 +239,20 @@ def _chart_links(ax, run: dict[str, Any], colors: Palette, colour: dict[str, str
                 counts = trial.get("link_attempts", {}).get(link_name(a, b), {"attempts": 0, "successes": 0})
                 failed = counts["attempts"] - counts["successes"]
                 rates.append(100 * failed / counts["attempts"] if counts["attempts"] else 0)
-                notes.append(f"{failed} of {counts['attempts']}")
+                notes.append(f"{failed:,} of {counts['attempts']:,}")
             xs = [i + (index - (len(trials) - 1) / 2) * width for i in range(len(hops))]
             bars = ax.bar(xs, rates, width=width * 0.92, color=colour[trial["label"]], label=trial["label"],
                           edgecolor=colors.canvas, linewidth=2)
             for bar, note in zip(bars, notes):
-                ax.annotate(note, (bar.get_x() + bar.get_width() / 2, bar.get_height()), xytext=(0, 3),
-                            textcoords="offset points", ha="center", fontsize=8, color=colors.text)
+                if len(trials) > 2:
+                    # Three bars side by side leave no room above them, so the counts go up the bar,
+                    # and only when this chart is shown on its own, where the bars are tall enough.
+                    if len(ax.figure.axes) == 1:
+                        ax.annotate(note, (bar.get_x() + bar.get_width() / 2, bar.get_height() / 2), rotation=90,
+                                    ha="center", va="center", fontsize=7.5, color=colors.canvas)
+                else:
+                    ax.annotate(note, (bar.get_x() + bar.get_width() / 2, bar.get_height()), xytext=(0, 3),
+                                textcoords="offset points", ha="center", fontsize=8, color=colors.text)
         names = []
         for a, b in hops:
             length = km.get(link_name(a, b))
@@ -229,36 +263,62 @@ def _chart_links(ax, run: dict[str, Any], colors: Palette, colour: dict[str, str
         ax.yaxis.set_major_formatter(PercentFormatter())
         ax.set_ylabel("Attempts that failed")
         if len(trials) > 1:
-            ax.legend(loc="upper center", ncols=len(trials), frameon=False, fontsize=9, labelcolor=colors.text)
+            ax.legend(loc="upper center", ncols=len(trials), frameon=False, fontsize=9 if len(trials) < 3 else 8,
+                      labelcolor=colors.text, handlelength=1.5, columnspacing=1.2)
     else:
         ax.text(0.5, 0.5, "No route was booked in this run", ha="center", va="center",
                 transform=ax.transAxes, color=colors.muted)
+
+
+def _first_levels(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The first time each fidelity level appears. Pairs at the same level share one fidelity value."""
+    first: dict[float, tuple[float, float]] = {}
+    for t, f in points:
+        first.setdefault(round(f, 4), (t, f))
+    return list(first.values())
 
 
 def _chart_fidelity(ax, run: dict[str, Any], colors: Palette, colour: dict[str, str]) -> None:
     """Chart 4: were the pairs good enough to use? Fidelity after each swap and at delivery, against the target."""
     trials, source, destination, window = _basics(run)
     target = trials[0].get("target_fidelity")
+    purified_any = any(_purifies(t) for t in trials)
     ax = _panel(ax, colors, "4. Were the pairs good enough to use?",
                 "Fidelity is a pair's quality (1.0 = perfect). A swap joins two pairs into one longer pair, "
-                "but lowers its fidelity.")
+                "but lowers its fidelity." + (" Purifying turns two pairs into one better pair, a step up. "
+                                              "A trial that purifies shows each level once, the first time it "
+                                              "was reached." if purified_any else ""))
     key = []  # Colour per trial, then what hollow and filled dots mean.
-    lowest, any_swaps, any_deliveries = 0.5, False, False
+    lowest, any_swaps, any_deliveries, any_purified = 0.5, False, False, False
     for trial in trials:
         swaps = [(e["t"] - trial["start_s"], e["fidelity"]) for e in trial["events"] if e["type"] == "ES_SUCCESS"]
+        # Both ends report a purification. Plot it once.
+        purified = [(e["t"] - trial["start_s"], e["fidelity"]) for e in trial["events"]
+                    if e["type"] == "EP_SUCCESS" and e["node"] < e.get("remote_node", "")]
         deliveries = [(e["t"] - trial["start_s"], e["fidelity"]) for e in _deliveries(trial)]
-        lowest = min([lowest] + [f for _, f in swaps + deliveries])
         tint = colour[trial["label"]]
+        if _purifies(trial):
+            # Thousands of points otherwise. Joined in time order, the levels show fidelity dropping
+            # at each swap and climbing back up with each purify round.
+            swaps, purified = _first_levels(swaps), _first_levels(purified)
+            ax.plot(*zip(*sorted(swaps + purified + deliveries[:1])), color=tint, linewidth=1, alpha=0.6)
+        lowest = min([lowest] + [f for _, f in swaps + purified + deliveries])
         if swaps:
             ax.scatter(*zip(*swaps), s=40, facecolors="none", edgecolors=tint, linewidths=1.5)
+        if purified:
+            ax.scatter(*zip(*purified), s=36, marker="^", facecolors="none", edgecolors=tint, linewidths=1.2)
+            any_purified = True
         if deliveries:
             ax.scatter(*zip(*deliveries), s=64, color=tint, edgecolors=colors.canvas, linewidths=1.5, zorder=3)
-        if swaps or deliveries:
+        if swaps or purified or deliveries:
             key.append(Line2D([], [], linestyle="none", marker="s", markersize=8, color=tint, label=trial["label"]))
         any_swaps, any_deliveries = any_swaps or bool(swaps), any_deliveries or bool(deliveries)
     if any_swaps:
         key.append(Line2D([], [], linestyle="none", marker="o", markersize=7, markerfacecolor="none",
                           markeredgecolor=colors.muted, markeredgewidth=1.5, label="pair after a swap"))
+    if any_purified:
+        key.append(Line2D([], [], linestyle="none", marker="^", markersize=7, markerfacecolor="none",
+                          markeredgecolor=colors.muted, markeredgewidth=1.2, label="pair after purifying"))
     if any_deliveries:
         key.append(Line2D([], [], linestyle="none", marker="o", markersize=8, color=colors.muted,
                           label=f"pair delivered to {destination}"))
@@ -278,7 +338,11 @@ def _chart_fidelity(ax, run: dict[str, Any], colors: Palette, colour: dict[str, 
     ax.set_ylim(bottom, 1.02)
     ax.set_xlabel("Seconds since the request window opened")
     ax.set_ylabel("Fidelity (1.0 = perfect)")
-    if key:
+    if key and any_purified:
+        # The purify levels fill the lower left, so the key goes beside the chart.
+        ax.legend(handles=key, fontsize=9, labelcolor=colors.text, loc="center left", bbox_to_anchor=(1.01, 0.5),
+                  handletextpad=0.3, frameon=False)
+    elif key:
         ax.legend(handles=key, fontsize=9, labelcolor=colors.text, loc="lower left", ncols=2 if len(key) > 2 else 1,
                   handletextpad=0.3, columnspacing=1.2, frameon=True, facecolor=colors.canvas, edgecolor="none",
                   framealpha=0.85)
@@ -358,6 +422,14 @@ def save_png(drawn: dict[str, Any] | list[dict[str, Any]], target: Path, colors:
     figure.savefig(target, dpi=150, facecolor=figure.get_facecolor())
 
 
+def _purify_text(trial: dict[str, Any]) -> str:
+    purified = trial.get("purifications") or {}
+    tried = purified.get("success", 0) + purified.get("failure", 0)
+    if not tried:
+        return "none" + (" (1 memory)" if trial.get("memories") == 1 else "")
+    return f"{purified['failure']:,} of {tried:,} ({100 * purified['failure'] / tried:.0f}%)"
+
+
 def table_rows(run: dict[str, Any]) -> list[tuple[str, ...]]:
     rows = []
     for trial in run["trials"]:
@@ -373,18 +445,20 @@ def table_rows(run: dict[str, Any]) -> list[tuple[str, ...]]:
             trial["label"],
             " → ".join(name.replace("node", "") for name in path) + (f" ({km:g} km)" if km else "") or "none",
             _pairs(trial["delivered"]),
-            f"{first * 1000:.0f} ms" if first is not None else "none arrived",
+            ("none arrived" if first is None else f"{first * 1000:.0f} ms" if first < 1 else f"{first:.1f} s"),
             f"{fidelity:.3f}" if fidelity is not None else "none delivered",
-            f"{failed} of {tried} ({100 * failed / tried:.0f}%)" if tried else "",
-            f"{swaps['failure']} of {swaps['success'] + swaps['failure']}" if swaps else "",
+            f"{failed:,} of {tried:,} ({100 * failed / tried:.0f}%)" if tried else "",
+            f"{swaps['failure']:,} of {swaps['success'] + swaps['failure']:,}" if swaps else "",
+            _purify_text(trial),
         ))
     return rows
 
 
 COLUMNS = ("Trial", "Path Dijkstra picked", "Bell pairs delivered", "First pair arrived after",
-           "Average fidelity", "Link attempts that failed", "Swaps that failed")
-WIDTHS = {"Trial": 195, "Path Dijkstra picked": 180, "Bell pairs delivered": 145, "First pair arrived after": 165,
-          "Average fidelity": 115, "Link attempts that failed": 175, "Swaps that failed": 125}
+           "Average fidelity", "Link attempts that failed", "Swaps that failed", "Purifications that failed")
+WIDTHS = {"Trial": 170, "Path Dijkstra picked": 185, "Bell pairs delivered": 135, "First pair arrived after": 160,
+          "Average fidelity": 115, "Link attempts that failed": 175, "Swaps that failed": 120,
+          "Purifications that failed": 175}
 
 
 class StatsWindow(tk.Toplevel):
